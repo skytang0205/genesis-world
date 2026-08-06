@@ -838,6 +838,79 @@ class PBDOptions(Options):
             self._hash_grid_res = np.ceil(np.array(self.hash_grid_res) / self.hash_grid_cell_size).astype(gs.np_int)
 
 
+class DEMOptions(Options):
+    """
+    Options configuring the DEMSolver.
+
+    Note
+    ----
+    DEM (Discrete Element Method) solver for simulating granular materials (sand) as spherical particles,
+    following the contact model and time-stepping of the reference implementation. The solver runs its own
+    sub-substeps inside each simulator substep: a base step `ddt = radius * pi * sqrt(density / young) / 2`,
+    further clamped by the velocity-adaptive rule `ddt = min(2 * radius / (max_vel + sqrt(9.8 * 2 * radius)), ddt)`.
+
+    If spatial hashing parameters are not given, they are computed automatically from `particle_size` and bounds.
+
+    Parameters
+    ----------
+    dt : float, optional
+        Time duration for each simulation step in seconds. If none, it will inherit from `SimOptions`. Defaults to None.
+    gravity : tuple, optional
+        Gravity force in N/kg. If none, it will inherit from `SimOptions`. Defaults to None.
+    particle_size : float, optional
+        Particle diameter in meters. Defaults to 1e-2.
+    lower_bound : tuple, shape (3,), optional
+        Lower bound of the simulation domain. The domain walls act as a static box collider for the particles.
+        Defaults to (-1.0, -1.0, 0.0).
+    upper_bound : tuple, shape (3,), optional
+        Upper bound of the simulation domain. Defaults to (1.0, 1.0, 1.0).
+    hash_grid_res : tuple, optional
+        Size of the spatially-repetitive spatial hashing grid in meters. If none, it will be computed automatically. Defaults to None.
+    hash_grid_cell_size : float, optional
+        Size of the cubic cell of the spatial hashing grid in meters. This should be at least 1.25 * `particle_size`.
+        If none, it will be computed automatically. Defaults to None.
+    """
+
+    dt: PositiveFloat | None = None
+    gravity: Vec3FType | None = None
+
+    particle_size: PositiveFloat = 1e-2
+
+    # spatial hashing
+    hash_grid_res: Vec3FType | None = None  # size of the spatially-repetitive hash grid in meters
+    hash_grid_cell_size: PositiveFloat | None = None  # size of the cubic cell in meters
+
+    lower_bound: Vec3FType = (-1.0, -1.0, 0.0)
+    upper_bound: Vec3FType = (1.0, 1.0, 1.0)
+
+    _hash_grid_res: np.ndarray = PrivateAttr(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_defaults(cls, data: dict) -> dict:
+        particle_size = data.get("particle_size", 1e-2)
+        # NOTE: 1.25 * particle_size = 2.5 * radius, which covers the neighbor-search cutoff of sqrt(6) * radius
+        # used by the DEM contact model, so a 3x3x3 cell neighborhood never misses a contact pair.
+        if data.get("hash_grid_cell_size") is None:
+            data["hash_grid_cell_size"] = 1.25 * particle_size
+        return data
+
+    def model_post_init(self, context: Any) -> None:
+        if not np.all(np.array(self.upper_bound) > np.array(self.lower_bound)):
+            gs.raise_exception("Invalid pair of upper_bound and lower_bound.")
+
+        if self.hash_grid_cell_size < 1.25 * self.particle_size:
+            gs.raise_exception("`hash_grid_cell_size` should not be smaller than 1.25 * `particle_size`.")
+
+        if self.hash_grid_res is None:
+            max_hash_grid_res = np.ceil(
+                (np.array(self.upper_bound) - np.array(self.lower_bound)) / self.hash_grid_cell_size
+            ).astype(gs.np_int)
+            self._hash_grid_res = np.minimum(max_hash_grid_res, np.array([150, 150, 150], dtype=gs.np_int))
+        else:
+            self._hash_grid_res = np.ceil(np.array(self.hash_grid_res) / self.hash_grid_cell_size).astype(gs.np_int)
+
+
 class FEMOptions(Options):
     """
     Options configuring the FEMSolver.

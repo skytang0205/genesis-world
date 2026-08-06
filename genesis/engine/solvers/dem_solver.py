@@ -1,0 +1,553 @@
+import math
+
+import numpy as np
+import quadrants as qd
+
+import genesis as gs
+from genesis.engine.boundaries import CubeBoundary
+from genesis.engine.entities import DEMEntity
+from genesis.utils.geom import SpatialHasher
+
+from .base_solver import Solver
+
+
+@qd.data_oriented
+class DEMSolver(Solver):
+    """
+    DEM (Discrete Element Method) solver for granular materials (sand), ported from the reference
+    implementation `sand-water-coupling-PIC-DEM-3d`. All formulas strictly follow the C++ code:
+
+    - Base sub-substep: `ddt = radius * pi * sqrt(density / young_modulus) / 2`.
+    - Velocity-adaptive clamp, re-evaluated before every sub-substep:
+      `ddt = min(2 * radius / (max_vel + sqrt(9.8 * 2 * radius)), ddt)`.
+    - Contact force on grain i from grain j (penetration `pen = 2 * radius - |dij|`):
+      normal `K_norm * pen * n` with `K_norm = young * radius`;
+      shear `-K_tang * v_tangential` with `K_tang = K_norm * poisson`,
+      clamped by the Coulomb limit `|f_shear| <= |f_normal| * tan(friction_angle)`.
+    - Per sub-substep order: assemble acceleration (gravity + contact / mass), enforce the box collider,
+      then `v += a * ddt`, `x += v * ddt`.
+    - Box collider (static walls at the domain bounds, signed distance `phi` positive inside):
+      trigger zone `phi < 0.5 * radius`; projection `x -= n * phi` and velocity reflection
+      `v -= 1.5 * (v . n) * n` when `phi < 0`; wall friction `a += (a . n) * tan(friction_angle) * t_hat`
+      on the acceleration when `a . n < 0`, where `t_hat` is the normalized tangential velocity.
+
+    The capillary (liquid-bridge) cohesion of the reference is identically zero for dry sand
+    (its coefficient vanishes at zero saturation) and is therefore omitted until the wet-sand coupling phase.
+    """
+
+    def __init__(self, scene, sim, options):
+        super().__init__(scene, sim, options)
+
+        self._particle_size = options.particle_size
+        self._particle_radius = options.particle_size / 2.0
+        self._upper_bound = np.array(options.upper_bound)
+        self._lower_bound = np.array(options.lower_bound)
+
+        # spatial hasher for neighbor search (cell >= 1.25 * particle_size = 2.5 * radius > sqrt(6) * radius)
+        self.sh = SpatialHasher(
+            cell_size=options.hash_grid_cell_size,
+            grid_res=options._hash_grid_res,
+        )
+
+        # used for the entity sampling bounds check only; contact handling follows the C++ box collider above
+        self.boundary = CubeBoundary(
+            lower=self._lower_bound,
+            upper=self._upper_bound,
+        )
+
+        # base DEM sub-substep, computed at build time from the entity materials
+        self._m_ddt = None
+
+    def build(self):
+        super().build()
+
+        self._B = self._sim._B
+        self._n_particles = self.n_particles
+
+        if self.is_active:
+            self.sh.build(self._B)
+            self.init_particle_fields()
+            for entity in self._entities:
+                entity._add_to_solver()
+
+            self._m_ddt = min(
+                self._particle_radius
+                * math.pi
+                * math.sqrt(entity.material.rho / entity.material.young_modulus)
+                / 2.0
+                for entity in self._entities
+            )
+
+        # FIXME: _gravity must be a raw qd.field() -- see comment in mpm_solver.py
+        if self._gravity is not None:
+            gravity = self._gravity.to_numpy()
+            self._gravity = qd.field(dtype=gs.qd_vec3, shape=(self._B,))
+            self._gravity.from_numpy(gravity)
+
+    def init_particle_fields(self):
+        # static info
+        struct_particle_info = qd.types.struct(
+            mass=gs.qd_float,
+            radius=gs.qd_float,
+        )
+        # dynamic state; `acc` is the C++ `AccVelocity`, assembling gravity and contact forces each sub-substep
+        struct_particle_state = qd.types.struct(
+            pos=gs.qd_vec3,
+            vel=gs.qd_vec3,
+            acc=gs.qd_vec3,
+            active=gs.qd_bool,
+        )
+        # non-gradient state
+        struct_particle_state_ng = qd.types.struct(
+            reordered_idx=gs.qd_int,
+        )
+        # render state
+        struct_particle_state_render = qd.types.struct(
+            pos=gs.qd_vec3,
+            active=gs.qd_bool,
+        )
+
+        self.particles_info = struct_particle_info.field(shape=(self._n_particles,), layout=qd.Layout.SOA)
+        self.particles = struct_particle_state.field(shape=(self._n_particles, self._B), layout=qd.Layout.SOA)
+        self.particles_reordered = struct_particle_state.field(shape=(self._n_particles, self._B), layout=qd.Layout.SOA)
+        self.particles_ng = struct_particle_state_ng.field(shape=(self._n_particles, self._B), layout=qd.Layout.SOA)
+        self.particles_render = struct_particle_state_render.field(
+            shape=(self._n_particles, self._B), layout=qd.Layout.SOA
+        )
+
+    @property
+    def is_active(self):
+        return self.n_particles > 0
+
+    def add_entity(self, idx, material, morph, surface, name=None):
+        entity = DEMEntity(
+            scene=self.scene,
+            solver=self,
+            material=material,
+            morph=morph,
+            surface=surface,
+            particle_size=self._particle_size,
+            idx=idx,
+            particle_start=self.n_particles,
+            name=name,
+        )
+        self._entities.append(entity)
+        return entity
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------------- kernels --------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @qd.kernel
+    def _kernel_add_particles(
+        self,
+        particle_start: qd.i32,
+        n_particles: qd.i32,
+        positions: qd.types.ndarray(element_dim=1),
+        radius: qd.f32,
+        density: qd.f32,
+    ):
+        volume = (4.0 / 3.0) * math.pi * radius * radius * radius
+        mass = density * volume
+        for i_p_ in range(n_particles):
+            i_p = i_p_ + particle_start
+            self.particles_info[i_p].mass = mass
+            self.particles_info[i_p].radius = radius
+            for i_b in range(self._B):
+                self.particles[i_p, i_b].pos = positions[i_p_]
+                self.particles[i_p, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
+                self.particles[i_p, i_b].acc = qd.Vector.zero(gs.qd_float, 3)
+                self.particles[i_p, i_b].active = True
+
+    @qd.kernel
+    def _kernel_max_vel(self, max_vel: qd.types.ndarray()):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                qd.atomic_max(max_vel[i_b], self.particles[i_p, i_b].vel.norm())
+
+    @qd.kernel
+    def _kernel_reset_acc(self, f: qd.i32):
+        # C++ ApplyDEMForces: AccVelocity = gravity (coupling and absorbed-water terms are zero for dry sand)
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                self.particles[i_p, i_b].acc = self._gravity[i_b]
+
+    @qd.kernel
+    def _kernel_reorder_particles(self, f: qd.i32):
+        self.sh.compute_reordered_idx(
+            self._n_particles, self.particles.pos, self.particles.active, self.particles_ng.reordered_idx
+        )
+
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                reordered_idx = self.particles_ng[i_p, i_b].reordered_idx
+                self.particles_reordered[reordered_idx, i_b] = self.particles[i_p, i_b]
+
+    @qd.func
+    def _func_contact_force(
+        self,
+        i: qd.i32,
+        j: qd.i32,
+        i_b: qd.i32,
+        particle_radius: qd.f32,
+        inv_mass: qd.f32,
+        k_norm: qd.f32,
+        k_tang: qd.f32,
+        tan_fric: qd.f32,
+    ):
+        # C++ DEMForce::getForce(pi, pj), force on particle i; strictly elastic, no damping
+        pos_i = self.particles_reordered[i, i_b].pos
+        pos_j = self.particles_reordered[j, i_b].pos
+        dij = pos_j - pos_i
+        dist2 = dij.dot(dij)
+        if dist2 < 6.0 * particle_radius * particle_radius:
+            dist = qd.sqrt(dist2)
+            penetration = 2.0 * particle_radius - dist
+            if penetration > 0.0 and dist >= 0.001 * particle_radius:
+                n = dij / dist
+                vij = self.particles_reordered[j, i_b].vel - self.particles_reordered[i, i_b].vel
+                vij_tangential = vij - vij.dot(n) * n
+
+                f_normal = k_norm * penetration * n
+                f_shear = -k_tang * vij_tangential
+
+                max_fs = k_norm * penetration * tan_fric
+                fs_norm = f_shear.norm()
+                if fs_norm > max_fs:
+                    f_shear *= max_fs / fs_norm
+
+                f = -f_normal - f_shear
+                # C++ divides by (m + ratio * V); ratio == 0 for dry sand
+                self.particles_reordered[i, i_b].acc = self.particles_reordered[i, i_b].acc + f * inv_mass
+
+    @qd.kernel
+    def _kernel_contact_forces(
+        self,
+        f: qd.i32,
+        particle_radius: qd.f32,
+        inv_mass: qd.f32,
+        k_norm: qd.f32,
+        k_tang: qd.f32,
+        tan_fric: qd.f32,
+    ):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles_reordered[i_p, i_b].active:
+                base = self.sh.pos_to_grid(self.particles_reordered[i_p, i_b].pos)
+                for offset in qd.grouped(qd.ndrange((-1, 2), (-1, 2), (-1, 2))):
+                    slot_idx = self.sh.grid_to_slot(base + offset)
+                    for j in range(
+                        self.sh.slot_start[slot_idx, i_b],
+                        self.sh.slot_size[slot_idx, i_b] + self.sh.slot_start[slot_idx, i_b],
+                    ):
+                        if i_p != j and self.particles_reordered[j, i_b].active:
+                            self._func_contact_force(i_p, j, i_b, particle_radius, inv_mass, k_norm, k_tang, tan_fric)
+
+    @qd.kernel
+    def _kernel_copy_acc_from_reordered(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                reordered_idx = self.particles_ng[i_p, i_b].reordered_idx
+                self.particles[i_p, i_b].acc = self.particles_reordered[reordered_idx, i_b].acc
+
+    @qd.kernel
+    def _kernel_enforce_boundary(self, f: qd.i32, particle_radius: qd.f32, tan_fric: qd.f32):
+        # C++ Collider::Enforce(DEMParticles, ddt, radius) for a static box domain;
+        # phi is the signed distance to the domain box, positive inside
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                pos = self.particles[i_p, i_b].pos
+                vel = self.particles[i_p, i_b].vel
+                acc = self.particles[i_p, i_b].acc
+
+                phi = gs.qd_float(1e30)
+                n = qd.Vector.zero(gs.qd_float, 3)
+                for i_a in qd.static(range(3)):
+                    if pos[i_a] - self._lower_bound[i_a] < phi:
+                        phi = pos[i_a] - self._lower_bound[i_a]
+                        n = qd.Vector.zero(gs.qd_float, 3)
+                        n[i_a] = 1.0
+                    if self._upper_bound[i_a] - pos[i_a] < phi:
+                        phi = self._upper_bound[i_a] - pos[i_a]
+                        n = qd.Vector.zero(gs.qd_float, 3)
+                        n[i_a] = -1.0
+
+                if phi < 0.5 * particle_radius:
+                    if phi < 0.0:
+                        pos = pos - n * phi
+                        vel_n = vel.dot(n)
+                        if vel_n < 0.0:
+                            vel = vel - 1.5 * vel_n * n
+                    acc_n = acc.dot(n)
+                    if acc_n < 0.0:
+                        vel_tangential = vel - vel.dot(n) * n
+                        vt_norm = vel_tangential.norm()
+                        # C++ normalizes the tangential velocity unconditionally; guard the zero-velocity case
+                        if vt_norm > gs.EPS:
+                            acc = acc + acc_n * tan_fric * vel_tangential / vt_norm
+
+                    self.particles[i_p, i_b].pos = pos
+                    self.particles[i_p, i_b].vel = vel
+                    self.particles[i_p, i_b].acc = acc
+
+    @qd.kernel
+    def _kernel_integrate(self, f: qd.i32, ddt: qd.f32):
+        # C++ MoveDEMParticlesSplit: v += a * ddt, then x += v * ddt
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                self.particles[i_p, i_b].vel = self.particles[i_p, i_b].vel + self.particles[i_p, i_b].acc * ddt
+                self.particles[i_p, i_b].pos = self.particles[i_p, i_b].pos + self.particles[i_p, i_b].vel * ddt
+
+    @qd.kernel
+    def _kernel_update_render_fields(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            self.particles_render[i_p, i_b].pos = self.particles[i_p, i_b].pos
+            self.particles_render[i_p, i_b].active = self.particles[i_p, i_b].active
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------------ stepping --------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    def process_input(self, in_backward=False):
+        for entity in self._entities:
+            entity.process_input(in_backward=in_backward)
+
+    def process_input_grad(self):
+        pass
+
+    def _compute_max_vel(self):
+        max_vel = np.zeros((self._B,), dtype=gs.np_float)
+        self._kernel_max_vel(max_vel)
+        return float(max_vel.max())
+
+    def _dem_substep(self, f, ddt, inv_mass, k_norm, k_tang, tan_fric):
+        self._kernel_reset_acc(f)
+        self._kernel_reorder_particles(f)
+        self._kernel_contact_forces(f, self._particle_radius, inv_mass, k_norm, k_tang, tan_fric)
+        self._kernel_copy_acc_from_reordered(f)
+        self._kernel_enforce_boundary(f, self._particle_radius, tan_fric)
+        self._kernel_integrate(f, ddt)
+
+    def substep_pre_coupling(self, f):
+        if not self.is_active:
+            return
+
+        # contact stiffnesses and grain mass are global constants in C++ (m_ParticleMass, DEMForce);
+        # they are taken from the (single) material here
+        material = self._entities[0].material
+        volume = 4.0 / 3.0 * math.pi * self._particle_radius**3
+        inv_mass = float(1.0 / (material.rho * volume))
+        k_norm = float(material.young_modulus * self._particle_radius)
+        k_tang = float(k_norm * material.poisson_ratio)
+        tan_fric = float(math.tan(material.friction_angle))
+
+        # C++ MoveDEMParticles: split the simulator substep into adaptive DEM sub-substeps
+        dt = float(self._substep_dt)
+        while True:
+            max_vel = self._compute_max_vel() + math.sqrt(9.8 * self._particle_radius * 2.0)
+            ddt = min(2.0 * self._particle_radius / max_vel, self._m_ddt)
+            if dt < ddt:
+                break
+            dt -= ddt
+            self._dem_substep(f, ddt, inv_mass, k_norm, k_tang, tan_fric)
+        self._dem_substep(f, dt, inv_mass, k_norm, k_tang, tan_fric)
+
+    def substep_pre_coupling_grad(self, f):
+        pass
+
+    def substep_post_coupling(self, f):
+        if self.is_active:
+            self._kernel_update_render_fields(f)
+
+    def substep_post_coupling_grad(self, f):
+        pass
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------------ gradient --------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    def reset_grad(self):
+        pass
+
+    def collect_output_grads(self):
+        pass
+
+    def add_grad_from_state(self, state):
+        pass
+
+    def save_ckpt(self, ckpt_name):
+        pass
+
+    def load_ckpt(self, ckpt_name):
+        pass
+
+    # ------------------------------------------------------------------------------------
+    # -------------------------------------- state ---------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    def set_state(self, f, state, envs_idx=None):
+        if self.is_active:
+            self._kernel_set_state(f, state.pos, state.vel, state.active)
+
+    @qd.kernel
+    def _kernel_set_state(
+        self,
+        f: qd.i32,
+        pos: qd.types.ndarray(),
+        vel: qd.types.ndarray(),
+        active: qd.types.ndarray(),
+    ):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            for j in qd.static(range(3)):
+                self.particles[i_p, i_b].pos[j] = pos[i_b, i_p, j]
+                self.particles[i_p, i_b].vel[j] = vel[i_b, i_p, j]
+            self.particles[i_p, i_b].active = qd.cast(active[i_b, i_p], gs.qd_bool)
+
+    def get_state(self, f):
+        if self.is_active:
+            from genesis.engine.states.solvers import DEMSolverState
+
+            state = DEMSolverState(self.scene)
+            self._kernel_get_state(f, state.pos, state.vel, state.active)
+        else:
+            state = None
+        return state
+
+    def get_state_render(self):
+        if not self.is_active:
+            return None, None, None
+        self.update_render_fields()
+        return self.particles_render.pos, None, None
+
+    def update_render_fields(self):
+        self._kernel_update_render_fields(self.sim.cur_substep_local)
+
+    @qd.kernel
+    def _kernel_get_state(
+        self,
+        f: qd.i32,
+        pos: qd.types.ndarray(),
+        vel: qd.types.ndarray(),
+        active: qd.types.ndarray(),
+    ):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            for j in qd.static(range(3)):
+                pos[i_b, i_p, j] = self.particles[i_p, i_b].pos[j]
+                vel[i_b, i_p, j] = self.particles[i_p, i_b].vel[j]
+            active[i_b, i_p] = qd.cast(self.particles[i_p, i_b].active, gs.qd_bool)
+
+    @qd.kernel
+    def _kernel_set_particles_pos(
+        self,
+        particles_idx: qd.types.ndarray(),
+        envs_idx: qd.types.ndarray(),
+        poss: qd.types.ndarray(),
+    ):
+        for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            for i in qd.static(range(3)):
+                self.particles[i_p, i_b].pos[i] = poss[i_b_, i_p_, i]
+            self.particles[i_p, i_b].vel.fill(0.0)
+
+    @qd.kernel
+    def _kernel_get_particles_pos(
+        self,
+        particle_start: qd.i32,
+        n_particles: qd.i32,
+        envs_idx: qd.types.ndarray(),
+        poss: qd.types.ndarray(),
+    ):
+        for i_p_, i_b_ in qd.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            for i in qd.static(range(3)):
+                poss[i_b_, i_p_, i] = self.particles[i_p, i_b].pos[i]
+
+    @qd.kernel
+    def _kernel_set_particles_vel(
+        self,
+        particles_idx: qd.types.ndarray(),
+        envs_idx: qd.types.ndarray(),
+        vels: qd.types.ndarray(),
+    ):
+        for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            for i in qd.static(range(3)):
+                self.particles[i_p, i_b].vel[i] = vels[i_b_, i_p_, i]
+
+    @qd.kernel
+    def _kernel_get_particles_vel(
+        self,
+        particle_start: qd.i32,
+        n_particles: qd.i32,
+        envs_idx: qd.types.ndarray(),
+        vels: qd.types.ndarray(),
+    ):
+        for i_p_, i_b_ in qd.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            for i in qd.static(range(3)):
+                vels[i_b_, i_p_, i] = self.particles[i_p, i_b].vel[i]
+
+    @qd.kernel
+    def _kernel_set_particles_active(
+        self,
+        particles_idx: qd.types.ndarray(),
+        envs_idx: qd.types.ndarray(),
+        actives: qd.types.ndarray(),
+    ):
+        for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            self.particles[i_p, i_b].active = qd.cast(actives[i_b_, i_p_], gs.qd_bool)
+
+    @qd.kernel
+    def _kernel_get_particles_active(
+        self,
+        particle_start: qd.i32,
+        n_particles: qd.i32,
+        envs_idx: qd.types.ndarray(),
+        actives: qd.types.ndarray(),
+    ):
+        for i_p_, i_b_ in qd.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            actives[i_b_, i_p_] = self.particles[i_p, i_b].active
+
+    @qd.kernel
+    def _kernel_get_mass(
+        self, particle_start: qd.i32, n_particles: qd.i32, mass: qd.types.ndarray(), envs_idx: qd.types.ndarray()
+    ):
+        total_mass = gs.qd_float(0.0)
+        for i_p_ in range(n_particles):
+            i_p = i_p_ + particle_start
+            total_mass += self.particles_info[i_p].mass
+        for i_b_ in range(envs_idx.shape[0]):
+            mass[i_b_] = total_mass
+
+    # ------------------------------------------------------------------------------------
+    # ----------------------------------- properties -------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @property
+    def n_particles(self):
+        if self.is_built:
+            return self._n_particles
+        return sum([entity.n_particles for entity in self._entities])
+
+    @property
+    def particle_size(self):
+        return self._particle_size
+
+    @property
+    def particle_radius(self):
+        return self._particle_radius
+
+    @property
+    def upper_bound(self):
+        return self._upper_bound
+
+    @property
+    def lower_bound(self):
+        return self._lower_bound

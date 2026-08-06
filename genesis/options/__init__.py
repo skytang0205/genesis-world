@@ -3,6 +3,7 @@ from .profiling import ProfilingOptions
 from .solvers import (
     KinematicOptions,
     BaseCouplerOptions,
+    DEMOptions,
     FEMOptions,
     IPCCouplerOptions,
     LegacyCouplerOptions,
@@ -21,6 +22,7 @@ __all__ = [
     "KinematicOptions",
     "BaseCouplerOptions",
     "CoacdOptions",
+    "DEMOptions",
     "FEMOptions",
     "FoamOptions",
     "IPCCouplerOptions",

@@ -277,6 +277,41 @@ class PBDSolverState:
         return self._free
 
 
+class DEMSolverState:
+    """
+    Dynamic state queried from a DEMSolver.
+    """
+
+    def __init__(self, scene):
+        self._scene = scene
+        args = {
+            "dtype": gs.tc_float,
+            "requires_grad": scene.requires_grad,
+            "scene": self._scene,
+        }
+        self._pos = gs.zeros((scene.sim._B, scene.sim.dem_solver.n_particles, 3), **args)
+        self._vel = gs.zeros((self._scene.sim._B, scene.sim.dem_solver.n_particles, 3), **args)
+        args["dtype"] = gs.tc_bool
+        args["requires_grad"] = False
+        self._active = gs.zeros((self._scene.sim._B, scene.sim.dem_solver.n_particles), **args)
+
+    @property
+    def scene(self):
+        return self._scene
+
+    @property
+    def pos(self):
+        return self._pos
+
+    @property
+    def vel(self):
+        return self._vel
+
+    @property
+    def active(self):
+        return self._active
+
+
 class FEMSolverState:
     def __init__(self, scene):
         self._scene = scene

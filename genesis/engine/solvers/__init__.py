@@ -1,3 +1,4 @@
+from .dem_solver import DEMSolver
 from .kinematic_solver import KinematicSolver
 from .tool_solver import ToolSolver
 from .rigid.rigid_solver import RigidSolver

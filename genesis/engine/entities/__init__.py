@@ -1,4 +1,5 @@
 from .base_entity import Entity
+from .dem_entity import DEMEntity
 from .drone_entity import DroneEntity
 from .emitter import Emitter
 from .fem_entity import FEMEntity
