@@ -951,14 +951,18 @@ class RasterizerContext:
     def update_flip(self):
         if self.sim.flip_solver.is_active:
             particles_all = qd_to_numpy(self.sim.flip_solver.particles_render.pos) + self.scene.envs_offset
+            active_all = qd_to_numpy(self.sim.flip_solver.particles_render.active).astype(dtype=np.bool_, copy=False)
             for flip_entity in self.sim.flip_solver.entities:
                 for idx in self.rendered_envs_idx:
                     particles_env = particles_all[:, idx]
+                    active_env = active_all[:, idx]
 
                     if flip_entity.surface.vis_mode == "particle":
                         if self.render_particle_as == "sphere":
                             tfs = np.tile(np.eye(4), (flip_entity.n_particles, 1, 1))
                             tfs[:, :3, 3] = particles_env[flip_entity.particle_start : flip_entity.particle_end]
+                            # absorbed (inactive) particles get a zero transform, making them invisible
+                            tfs[~active_env[flip_entity.particle_start : flip_entity.particle_end]] = 0.0
 
                             node = self.static_nodes[(idx, flip_entity.uid)]
                             self.jit.update_buffer(node, "model", tfs.transpose((0, 2, 1)))

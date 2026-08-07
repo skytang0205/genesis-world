@@ -835,6 +835,86 @@ class FLIPSolver(Solver):
                     dpos[axis] = val
                 self.particles[i_p, i_b].pos = pos + dpos
 
+    # ------------------------------ water absorption ------------------------------
+
+    @qd.kernel
+    def _kernel_wet_reset(self, f: qd.i32):
+        # C++ WetDEMParticle first half: per-cell water demand of the sand, max_ratio = 0.1
+        self.needed_ratio.fill(0.0)
+        self.absorb_ratio.fill(0.0)
+        self.absorb_count.fill(0)
+        self.absorb_vel.fill(qd.Vector.zero(gs.qd_float, 3))
+        dem = self._sim.dem_solver
+        max_cell = qd.Vector(self.needed_ratio.shape, dt=gs.qd_int) - 1
+        for i_p, i_b in qd.ndrange(dem._n_particles, self._B):
+            if dem.particles[i_p, i_b].active:
+                need = 0.1 - dem.particles[i_p, i_b].ratio
+                base, frac = self._func_trilerp_weights(
+                    dem.particles[i_p, i_b].pos, qd.Vector([0.5, 0.5, 0.5])
+                )
+                for i, j, k in qd.static(qd.ndrange(2, 2, 2)):
+                    w = (frac[0] if i else 1.0 - frac[0]) * (frac[1] if j else 1.0 - frac[1]) * (
+                        frac[2] if k else 1.0 - frac[2]
+                    )
+                    cell = self._func_clamp_idx(base + qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
+                    qd.atomic_add(self.needed_ratio[cell], w * need)
+
+    @qd.kernel
+    def _kernel_absorb_mark(self, f: qd.i32):
+        # C++ CacheFluidIndex + WetDEMParticle middle: per cell, the first
+        # floor(needed_ratio / single_ratio) visiting fluid particles are absorbed (the reference picks
+        # them via std::shuffle; the GPU atomic visit order is equally unbiased)
+        max_cell = qd.Vector(self.needed_ratio.shape, dt=gs.qd_int) - 1
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                cell = qd.floor(
+                    (self.particles[i_p, i_b].pos - self._lower_v) * self._inv_dx, gs.qd_int
+                )
+                cell = self._func_clamp_idx(cell, max_cell)
+                ticket = qd.atomic_add(self.absorb_count[cell], 1)
+                if ticket < qd.floor(self.needed_ratio[cell] / self._single_ratio, gs.qd_int):
+                    self.particles[i_p, i_b].active = False
+                    qd.atomic_add(self.absorb_ratio[cell], self._single_ratio)
+                    qd.atomic_add(self.absorb_vel[cell], self.particles[i_p, i_b].vel)
+
+    @qd.kernel
+    def _kernel_absorb_finalize(self, f: qd.i32):
+        # average the absorbed particles' velocity per cell (C++ accumulates v / num)
+        for cell in qd.grouped(self.absorb_ratio):
+            n = qd.round(self.absorb_ratio[cell] / self._single_ratio, gs.qd_int)
+            if n > 0:
+                self.absorb_vel[cell] = self.absorb_vel[cell] / n
+
+    @qd.kernel
+    def _kernel_wet_dem_particles(self, f: qd.i32):
+        # C++ WetDEMParticle last half: each grain gathers its share of the absorbed water
+        dem = self._sim.dem_solver
+        max_cell = qd.Vector(self.needed_ratio.shape, dt=gs.qd_int) - 1
+        for i_p, i_b in qd.ndrange(dem._n_particles, self._B):
+            if dem.particles[i_p, i_b].active:
+                ratio = dem.particles[i_p, i_b].ratio
+                base, frac = self._func_trilerp_weights(
+                    dem.particles[i_p, i_b].pos, qd.Vector([0.5, 0.5, 0.5])
+                )
+                add_ratio = gs.qd_float(0.0)
+                add_vel = qd.Vector.zero(gs.qd_float, 3)
+                for i, j, k in qd.static(qd.ndrange(2, 2, 2)):
+                    w = (frac[0] if i else 1.0 - frac[0]) * (frac[1] if j else 1.0 - frac[1]) * (
+                        frac[2] if k else 1.0 - frac[2]
+                    )
+                    cell = self._func_clamp_idx(base + qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
+                    ar = (0.1 - ratio) * self.absorb_ratio[cell] / qd.max(self.needed_ratio[cell], 1e-12)
+                    add_ratio += w * ar
+                    add_vel += self.absorb_vel[cell] * (w * ar)
+                if add_ratio > 0.0:
+                    add_vel = add_vel / add_ratio - dem.particles[i_p, i_b].vel
+                    dem.particles[i_p, i_b].add_ratio = add_ratio
+                    dem.particles[i_p, i_b].add_velocity = add_vel
+                    dem.particles[i_p, i_b].ratio = ratio + add_ratio
+                else:
+                    dem.particles[i_p, i_b].add_ratio = 0.0
+                    dem.particles[i_p, i_b].add_velocity = qd.Vector.zero(gs.qd_float, 3)
+
     # ------------------------------ PCG driver ------------------------------
 
     @qd.kernel
@@ -970,6 +1050,14 @@ class FLIPSolver(Solver):
 
         # 6. G2P (FLIP/PIC blend)
         self._kernel_g2p(f)
+
+        # 7. water absorption by sand (C++ CacheFluidIndex / WetDEMParticle / RemoveDeadParticle;
+        # absorbed fluid particles are deactivated in place instead of being erased)
+        if self._dem_coupling:
+            self._kernel_wet_reset(f)
+            self._kernel_absorb_mark(f)
+            self._kernel_absorb_finalize(f)
+            self._kernel_wet_dem_particles(f)
 
         # C++ m_LastDeltaTime = deltaTime at the end of Advance
         self._last_dt = dt
