@@ -28,6 +28,9 @@ class FLIPSolver(Solver):
        and the free-surface theta condition; extrapolate; enforce solid faces; record the velocity diff.
     6. G2P: FLIP (particle velocity + interpolated diff) blended with PIC by `blend_factor` (0.95).
 
+    The fluid time step is CFL-adaptive, following the reference's `GetCourantTimeStep`: each simulator
+    substep is split into water steps of `min(2 * dx / max|v_face|, remaining_dt)`.
+
     Differences from the reference (all recorded in the project log): the AMGCL solve is replaced by a
     GPU Jacobi-PCG with matrix-free matvecs; the sand-coupling solid-fraction terms reduce to 1 until
     the coupling phase; volume smoothing / redistancing of the level set are skipped (they only affect
@@ -630,6 +633,16 @@ class FLIPSolver(Solver):
             self.vdiff_w[idx] = self.vel_w[idx] - self.vdiff_w[idx]
 
     @qd.kernel
+    def _kernel_max_face_vel(self, max_vel: qd.types.ndarray()):
+        # C++ GetMaxAbsComponent: max absolute component over all MAC faces
+        for idx in qd.grouped(self.vel_u):
+            qd.atomic_max(max_vel[0], abs(self.vel_u[idx]))
+        for idx in qd.grouped(self.vel_v):
+            qd.atomic_max(max_vel[0], abs(self.vel_v[idx]))
+        for idx in qd.grouped(self.vel_w):
+            qd.atomic_max(max_vel[0], abs(self.vel_w[idx]))
+
+    @qd.kernel
     def _kernel_g2p(self, f: qd.i32):
         # C++ TransferFromGridToParticles (FLIP): v += interp(veldiff), blended with PIC by blend_factor
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
@@ -815,8 +828,20 @@ class FLIPSolver(Solver):
         if not self.is_active:
             return
 
-        dt = float(self._substep_dt)
+        # C++ GetCourantTimeStep: fluid steps of dt_f = min(2 * dx / max|v_face|, remaining dt) within
+        # each simulator substep (the reference's upper clamp m_ddt * 1000 is always looser than the
+        # simulator substep here, and its lower clamp is 0)
+        dt_remaining = float(self._substep_dt)
+        while dt_remaining > 0.0:
+            max_vel = np.zeros(1, dtype=gs.np_float)
+            self._kernel_max_face_vel(max_vel)
+            cfl_dt = 2.0 * self._dx / max(float(max_vel[0]), 1e-12)
+            dt_f = min(cfl_dt, dt_remaining)
+            self._water_step(f, dt_f)
+            dt_remaining -= dt_f
 
+    def _water_step(self, f, dt):
+        # one full water step of the reference's Advance (water-only path)
         # 1. advect particles with the current grid velocity, rebuild the level set
         self._kernel_advect_particles(f, dt)
         self._kernel_reconstruct_levelset(f)
