@@ -8,6 +8,7 @@ from genesis.options.solvers import (
     KinematicOptions,
     BaseCouplerOptions,
     DEMOptions,
+    FLIPOptions,
     IPCCouplerOptions,
     LegacyCouplerOptions,
     SAPCouplerOptions,
@@ -27,6 +28,7 @@ from .solvers import (
     KinematicSolver,
     DEMSolver,
     FEMSolver,
+    FLIPSolver,
     MPMSolver,
     PBDSolver,
     RigidSolver,
@@ -91,6 +93,7 @@ class Simulator(RBC):
         sf_options: SFOptions,
         pbd_options: PBDOptions,
         dem_options: DEMOptions,
+        flip_options: FLIPOptions,
     ):
         self._scene = scene
 
@@ -106,6 +109,7 @@ class Simulator(RBC):
         self.sf_options = sf_options
         self.pbd_options = pbd_options
         self.dem_options = dem_options
+        self.flip_options = flip_options
 
         self._dt: float = options.dt
         self._substep_dt: float = options.dt / options.substeps
@@ -127,6 +131,7 @@ class Simulator(RBC):
         self.fem_solver = FEMSolver(self.scene, self, self.fem_options)
         self.sf_solver = SFSolver(self.scene, self, self.sf_options)
         self.dem_solver = DEMSolver(self.scene, self, self.dem_options)
+        self.flip_solver = FLIPSolver(self.scene, self, self.flip_options)
 
         self._solvers: list["Solver"] = gs.List(
             [
@@ -139,6 +144,7 @@ class Simulator(RBC):
                 self.fem_solver,
                 self.sf_solver,
                 self.dem_solver,
+                self.flip_solver,
             ]
         )
 
@@ -184,6 +190,8 @@ class Simulator(RBC):
             entity = self.pbd_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.DEM.Base):
             entity = self.dem_solver.add_entity(self.n_entities, material, morph, surface, name=name)
+        elif isinstance(material, gs.materials.FLIP.Base):
+            entity = self.flip_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.FEM.Base):
             entity = self.fem_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.Hybrid):

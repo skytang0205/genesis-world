@@ -165,6 +165,7 @@ class RasterizerContext:
         self.on_sph()
         self.on_pbd()
         self.on_dem()
+        self.on_flip()
         self.on_fem()
 
         # segmentation mapping
@@ -929,6 +930,39 @@ class RasterizerContext:
                             node = self.static_nodes[(idx, dem_entity.uid)]
                             self.jit.update_buffer(node, "model", tfs.transpose((0, 2, 1)))
 
+    def on_flip(self):
+        if self.sim.flip_solver.is_active:
+            for flip_entity in self.sim.flip_solver.entities:
+                for idx in self.rendered_envs_idx:
+                    if flip_entity.surface.vis_mode == "particle":
+                        if self.render_particle_as == "sphere":
+                            mesh = mu.create_sphere(
+                                self.sim.flip_solver.particle_radius * self.particle_size_scale, subdivisions=1
+                            )
+                            mesh.visual = mu.surface_uvs_to_trimesh_visual(
+                                flip_entity.surface, n_verts=len(mesh.vertices)
+                            )
+                            tfs = np.tile(np.eye(4), (flip_entity.n_particles, 1, 1))
+                            tfs[:, :3, 3] = flip_entity.init_particles
+                            self.add_static_node(
+                                flip_entity, pyrender.Mesh.from_trimesh(mesh, smooth=True, poses=tfs), i_b=idx
+                            )
+
+    def update_flip(self):
+        if self.sim.flip_solver.is_active:
+            particles_all = qd_to_numpy(self.sim.flip_solver.particles_render.pos) + self.scene.envs_offset
+            for flip_entity in self.sim.flip_solver.entities:
+                for idx in self.rendered_envs_idx:
+                    particles_env = particles_all[:, idx]
+
+                    if flip_entity.surface.vis_mode == "particle":
+                        if self.render_particle_as == "sphere":
+                            tfs = np.tile(np.eye(4), (flip_entity.n_particles, 1, 1))
+                            tfs[:, :3, 3] = particles_env[flip_entity.particle_start : flip_entity.particle_end]
+
+                            node = self.static_nodes[(idx, flip_entity.uid)]
+                            self.jit.update_buffer(node, "model", tfs.transpose((0, 2, 1)))
+
     def on_fem(self):
         if self.sim.fem_solver.is_active:
             vverts_pos, _, _ = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
@@ -1207,6 +1241,7 @@ class RasterizerContext:
         self.update_sph()
         self.update_pbd()
         self.update_dem()
+        self.update_flip()
         self.update_fem()
         self.update_sensors()
 

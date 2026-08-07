@@ -917,6 +917,60 @@ class DEMOptions(Options):
             self._hash_grid_res = np.ceil(np.array(self.hash_grid_res) / self.hash_grid_cell_size).astype(gs.np_int)
 
 
+class FLIPOptions(Options):
+    """
+    Options configuring the FLIPSolver.
+
+    Note
+    ----
+    FLIP/PIC solver for free-surface liquids on a MAC grid, following the reference implementation
+    (`sand-water-coupling-PIC-DEM-3d`): trilinear particle<->grid transfers, FLIP/PIC blending 0.95,
+    pressure projection with free-surface Dirichlet condition, and a density-correction (position
+    correction) pass. Particles are seeded on a stratified `seed_sub_factor`^3 per-cell pattern.
+
+    Parameters
+    ----------
+    dt : float, optional
+        Time duration for each simulation step in seconds. If none, it will inherit from `SimOptions`. Defaults to None.
+    gravity : tuple, optional
+        Gravity force in N/kg. If none, it will inherit from `SimOptions`. Defaults to None.
+    grid_res : int, optional
+        Number of MAC grid cells per axis of the simulation domain. Defaults to 64.
+    lower_bound : tuple, shape (3,), optional
+        Lower bound of the simulation domain. The domain walls act as a static box collider. Defaults to (-0.5, -0.5, 0.0).
+    upper_bound : tuple, shape (3,), optional
+        Upper bound of the simulation domain. Defaults to (0.5, 0.5, 1.0).
+    seed_sub_factor : int, optional
+        Particle seeding subdivision per cell: `seed_sub_factor`^3 particles per cell. Defaults to 3 (27 per cell),
+        matching the reference implementation.
+    blend_factor : float, optional
+        FLIP/PIC blending factor: 1.0 is pure FLIP (energetic, noisy), 0.0 is pure PIC (diffusive).
+        Defaults to 0.95, matching the reference implementation.
+    density_correction : bool, optional
+        Whether to run the density-correction (position correction) pass each substep. Slightly costlier but
+        keeps the particle distribution uniform. Defaults to True, matching the reference implementation.
+    pcg_max_iter : int, optional
+        Maximum iterations of the GPU preconditioned conjugate gradient solver used for the pressure and
+        density-correction systems (the reference uses AMGCL). Defaults to 200.
+    pcg_tol : float, optional
+        Relative residual tolerance of the PCG solver. Defaults to 1e-4.
+    """
+
+    dt: PositiveFloat | None = None
+    gravity: Vec3FType | None = None
+
+    grid_res: PositiveInt = 64
+    lower_bound: Vec3FType = (-0.5, -0.5, 0.0)
+    upper_bound: Vec3FType = (0.5, 0.5, 1.0)
+
+    seed_sub_factor: PositiveInt = 3
+    blend_factor: NonNegativeFloat = 0.95
+    density_correction: StrictBool = True
+
+    pcg_max_iter: PositiveInt = 200
+    pcg_tol: PositiveFloat = 1e-4
+
+
 class FEMOptions(Options):
     """
     Options configuring the FEMSolver.

@@ -22,6 +22,7 @@ from genesis.options import (
     KinematicOptions,
     BaseCouplerOptions,
     DEMOptions,
+    FLIPOptions,
     LegacyCouplerOptions,
     FEMOptions,
     MPMOptions,
@@ -82,6 +83,8 @@ class Scene(RBC):
         The options configuring the pbd_solver (``scene.sim.PBDSolver``).
     dem_options : gs.options.DEMOptions
         The options configuring the dem_solver (``scene.sim.DEMSolver``).
+    flip_options : gs.options.FLIPOptions
+        The options configuring the flip_solver (``scene.sim.FLIPSolver``).
     vis_options : gs.options.VisOptions
         The options configuring the visualization system (``scene.visualizer``). Visualizer controls both the interactive viewer and the cameras.
     viewer_options : gs.options.ViewerOptions
@@ -107,6 +110,7 @@ class Scene(RBC):
         sf_options: SFOptions | None = None,
         pbd_options: PBDOptions | None = None,
         dem_options: DEMOptions | None = None,
+        flip_options: FLIPOptions | None = None,
         vis_options: VisOptions | None = None,
         viewer_options: ViewerOptions | None = None,
         profiling_options: ProfilingOptions | None = None,
@@ -129,6 +133,7 @@ class Scene(RBC):
         sf_options = sf_options or SFOptions()
         pbd_options = pbd_options or PBDOptions()
         dem_options = dem_options or DEMOptions()
+        flip_options = flip_options or FLIPOptions()
         vis_options = vis_options or VisOptions()
         viewer_options = viewer_options or ViewerOptions()
         profiling_options = profiling_options or ProfilingOptions()
@@ -151,6 +156,7 @@ class Scene(RBC):
             sf_options,
             pbd_options,
             dem_options,
+            flip_options,
             vis_options,
             viewer_options,
             profiling_options,
@@ -168,6 +174,7 @@ class Scene(RBC):
         self.sf_options = sf_options.model_copy_from(sim_options)
         self.pbd_options = pbd_options.model_copy_from(sim_options)
         self.dem_options = dem_options.model_copy_from(sim_options)
+        self.flip_options = flip_options.model_copy_from(sim_options)
         self.profiling_options = profiling_options
 
         self.vis_options = vis_options
@@ -188,6 +195,7 @@ class Scene(RBC):
             sf_options=self.sf_options,
             pbd_options=self.pbd_options,
             dem_options=self.dem_options,
+            flip_options=self.flip_options,
         )
 
         # visualizer
@@ -231,6 +239,7 @@ class Scene(RBC):
         sf_options: SFOptions,
         pbd_options: PBDOptions,
         dem_options: DEMOptions,
+        flip_options: FLIPOptions,
         vis_options: VisOptions,
         viewer_options: ViewerOptions,
         profiling_options: ProfilingOptions,
@@ -268,6 +277,9 @@ class Scene(RBC):
 
         if not isinstance(dem_options, DEMOptions):
             gs.raise_exception("`dem_options` should be an instance of `DEMOptions`.")
+
+        if not isinstance(flip_options, FLIPOptions):
+            gs.raise_exception("`flip_options` should be an instance of `FLIPOptions`.")
 
         if not isinstance(vis_options, VisOptions):
             gs.raise_exception("`vis_options` should be an instance of `VisOptions`.")
@@ -456,7 +468,7 @@ class Scene(RBC):
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
                 )
 
-        elif isinstance(material, gs.materials.DEM.Base):
+        elif isinstance(material, (gs.materials.DEM.Base, gs.materials.FLIP.Base)):
             if surface.vis_mode is None:
                 surface.vis_mode = "particle"
 
@@ -1803,6 +1815,11 @@ class Scene(RBC):
     def dem_solver(self):
         """The scene's `dem_solver`, managing all the `DEMEntity` in the scene."""
         return self._sim.dem_solver
+
+    @property
+    def flip_solver(self):
+        """The scene's `flip_solver`, managing all the `FLIPEntity` in the scene."""
+        return self._sim.flip_solver
 
     @property
     def segmentation_idx_dict(self):
