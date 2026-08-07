@@ -251,6 +251,55 @@ class DEMSolver(Solver):
                 self.particles_reordered[reordered_idx, i_b] = self.particles[i_p, i_b]
 
     @qd.func
+    def _func_bezier_G(self, sr: qd.f32):
+        # C++ QuadraticBezierCoeff with (py0, py1, px1, py2) = (c0=0, cmc=1, cmcp=0.1, csat=-1.5)
+        py0, py1, px1, py2 = 0.0, 1.0, 0.1, -1.5
+        a = (px1 + 1.0) / 4.0
+        b = -2.0 * a
+        c = b * b
+        d = -4.0 * (1.0 + b - px1)
+        e = 2.0 * (1.0 + b - px1)
+        res = gs.qd_float(0.0)
+        if sr < 0.0:
+            res = py0
+        elif sr >= 1.0:
+            res = py2
+        elif sr <= px1:
+            t = sr / px1
+            omt = 1.0 - t
+            # C++ keeps t*t*py1 here (not py2); preserved as-is, recorded in the project log
+            res = omt * omt * py0 + 2.0 * t * omt * py1 + t * t * py1
+        else:
+            t = (b + qd.sqrt(c + d * (px1 - sr))) / e
+            omt = 1.0 - t
+            res = omt * omt * py1 + 2.0 * t * omt * py1 + t * t * py2
+        return res
+
+    @qd.func
+    def _func_capillary_force(self, n, dist: qd.f32, sr: qd.f32, particle_radius: qd.f32):
+        # C++ DEMForce::ComputeDemCapillaryForces (attractive, along -n), active for 0 < H < d_rupture.
+        # contact_angle is uninitialized in the reference (UB); we use its commented-out reference
+        # value of 30 degrees (recorded in the project log).
+        contact_angle = 30.0 / 180.0 * 3.141592653589793
+        r = particle_radius
+        Vb = 4.0 / 3.0 * 3.141592653589793 * r * r * r * 1e-4
+        d_rupture = (1.0 + 0.5 * contact_angle) * (Vb ** (1.0 / 3.0) + 0.1 * Vb ** (2.0 / 3.0))
+        surface_tensor_cof = 0.007
+
+        f = qd.Vector.zero(gs.qd_float, 3)
+        H = dist - 2.0 * r
+        if H < d_rupture and H > 0.0:
+            coeff_c = qd.max(0.0, self._func_bezier_G(sr) * surface_tensor_cof)
+            d = -H + qd.sqrt(H * H + Vb / (3.141592653589793 * r))
+            phi = qd.sqrt(
+                2.0 * H / r * (-1.0 + qd.sqrt(1.0 + Vb / (3.141592653589793 * r * H * H)))
+            )
+            neck = -2.0 * 3.141592653589793 * coeff_c * r * qd.cos(contact_angle) / (1.0 + H / (2.0 * d))
+            st = -2.0 * 3.141592653589793 * coeff_c * r * phi * qd.sin(contact_angle)
+            f = -n * (neck + st)
+        return f
+
+    @qd.func
     def _func_contact_force(
         self,
         i: qd.i32,
@@ -268,21 +317,29 @@ class DEMSolver(Solver):
         dist2 = dij.dot(dij)
         if dist2 < 6.0 * particle_radius * particle_radius:
             dist = qd.sqrt(dist2)
-            penetration = 2.0 * particle_radius - dist
-            if penetration > 0.0 and dist >= 0.001 * particle_radius:
+            if dist >= 0.001 * particle_radius:
                 n = dij / dist
-                vij = self.particles_reordered[j, i_b].vel - self.particles_reordered[i, i_b].vel
-                vij_tangential = vij - vij.dot(n) * n
+                f = qd.Vector.zero(gs.qd_float, 3)
+                penetration = 2.0 * particle_radius - dist
+                if penetration > 0.0:
+                    vij = self.particles_reordered[j, i_b].vel - self.particles_reordered[i, i_b].vel
+                    vij_tangential = vij - vij.dot(n) * n
 
-                f_normal = k_norm * penetration * n
-                f_shear = -k_tang * vij_tangential
+                    f_normal = k_norm * penetration * n
+                    f_shear = -k_tang * vij_tangential
 
-                max_fs = k_norm * penetration * tan_fric
-                fs_norm = f_shear.norm()
-                if fs_norm > max_fs:
-                    f_shear *= max_fs / fs_norm
+                    max_fs = k_norm * penetration * tan_fric
+                    fs_norm = f_shear.norm()
+                    if fs_norm > max_fs:
+                        f_shear *= max_fs / fs_norm
 
-                f = -f_normal - f_shear
+                    f = -f_normal - f_shear
+                # C++ getForce adds the capillary (liquid-bridge) force for separated pairs (0 < H < d_rupture)
+                sr = (
+                    self.particles_reordered[i, i_b].saturate_rate
+                    + self.particles_reordered[j, i_b].saturate_rate
+                ) * 0.5
+                f += self._func_capillary_force(n, dist, sr, particle_radius)
                 # C++ divides by the wet mass (m + ratio * V); inv_mass_eff == 1/m in dry-sand mode
                 self.particles_reordered[i, i_b].acc = (
                     self.particles_reordered[i, i_b].acc + f * self.particles_reordered[i, i_b].inv_mass_eff
