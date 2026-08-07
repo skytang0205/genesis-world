@@ -57,6 +57,7 @@ class DEMSolver(Solver):
 
         # base DEM sub-substep, computed at build time from the entity materials
         self._m_ddt = None
+        self._ddt_safety = options.ddt_safety
 
     def build(self):
         super().build()
@@ -344,7 +345,7 @@ class DEMSolver(Solver):
         dt = float(self._substep_dt)
         while True:
             max_vel = self._compute_max_vel() + math.sqrt(9.8 * self._particle_radius * 2.0)
-            ddt = min(2.0 * self._particle_radius / max_vel, self._m_ddt)
+            ddt = min(2.0 * self._particle_radius / max_vel, self._m_ddt) * self._ddt_safety
             if dt < ddt:
                 break
             dt -= ddt

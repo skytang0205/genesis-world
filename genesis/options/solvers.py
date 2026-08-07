@@ -859,6 +859,10 @@ class DEMOptions(Options):
         Gravity force in N/kg. If none, it will inherit from `SimOptions`. Defaults to None.
     particle_size : float, optional
         Particle diameter in meters. Defaults to 1e-2.
+    ddt_safety : float, optional
+        Safety factor applied to the DEM sub-substep `ddt = min(2 * radius / max_vel, m_ddt)`. Values below 1.0
+        deviate from the reference implementation but improve stability when many simultaneous contacts raise the
+        effective stiffness beyond what the base step `m_ddt` was derived for. Defaults to 1.0.
     lower_bound : tuple, shape (3,), optional
         Lower bound of the simulation domain. The domain walls act as a static box collider for the particles.
         Defaults to (-1.0, -1.0, 0.0).
@@ -875,6 +879,8 @@ class DEMOptions(Options):
     gravity: Vec3FType | None = None
 
     particle_size: PositiveFloat = 1e-2
+
+    ddt_safety: PositiveFloat = 1.0
 
     # spatial hashing
     hash_grid_res: Vec3FType | None = None  # size of the spatially-repetitive hash grid in meters
