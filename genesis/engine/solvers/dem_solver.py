@@ -17,9 +17,10 @@ class DEMSolver(Solver):
     DEM (Discrete Element Method) solver for granular materials (sand), ported from the reference
     implementation `sand-water-coupling-PIC-DEM-3d`. All formulas strictly follow the C++ code:
 
-    - Base sub-substep: `ddt = radius * pi * sqrt(density / young_modulus) / 2`.
-    - Velocity-adaptive clamp, re-evaluated before every sub-substep:
-      `ddt = min(2 * radius / (max_vel + sqrt(9.8 * 2 * radius)), ddt)`.
+    - Base sub-substep: `ddt = radius * pi * sqrt(density / young_modulus) / 2`, optionally scaled by
+      `DEMOptions.ddt_safety`. The reference's velocity-adaptive clamp `2 * radius / max_vel` is replaced
+      by a fixed step count per simulator substep (user decision: avoids a global max-velocity reduction
+      and GPU readback per sub-substep).
     - Contact force on grain i from grain j (penetration `pen = 2 * radius - |dij|`):
       normal `K_norm * pen * n` with `K_norm = young * radius`;
       shear `-K_tang * v_tangential` with `K_tang = K_norm * poisson`,
@@ -159,12 +160,6 @@ class DEMSolver(Solver):
                 self.particles[i_p, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
                 self.particles[i_p, i_b].acc = qd.Vector.zero(gs.qd_float, 3)
                 self.particles[i_p, i_b].active = True
-
-    @qd.kernel
-    def _kernel_max_vel(self, max_vel: qd.types.ndarray()):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
-            if self.particles[i_p, i_b].active:
-                qd.atomic_max(max_vel[i_b], self.particles[i_p, i_b].vel.norm())
 
     @qd.kernel
     def _kernel_reset_acc(self, f: qd.i32):
@@ -315,11 +310,6 @@ class DEMSolver(Solver):
     def process_input_grad(self):
         pass
 
-    def _compute_max_vel(self):
-        max_vel = np.zeros((self._B,), dtype=gs.np_float)
-        self._kernel_max_vel(max_vel)
-        return float(max_vel.max())
-
     def _dem_substep(self, f, ddt, inv_mass, k_norm, k_tang, tan_fric):
         self._kernel_reset_acc(f)
         self._kernel_reorder_particles(f)
@@ -341,16 +331,16 @@ class DEMSolver(Solver):
         k_tang = float(k_norm * material.poisson_ratio)
         tan_fric = float(math.tan(material.friction_angle))
 
-        # C++ MoveDEMParticles: split the simulator substep into adaptive DEM sub-substeps
+        # fixed sub-substep (the reference's velocity-adaptive clamp is removed by user decision):
+        # as many full `ddt` steps as fit into the simulator substep, plus one remainder step
+        ddt = self._m_ddt * self._ddt_safety
         dt = float(self._substep_dt)
-        while True:
-            max_vel = self._compute_max_vel() + math.sqrt(9.8 * self._particle_radius * 2.0)
-            ddt = min(2.0 * self._particle_radius / max_vel, self._m_ddt) * self._ddt_safety
-            if dt < ddt:
-                break
-            dt -= ddt
+        n_full = int(dt / ddt)
+        for _ in range(n_full):
             self._dem_substep(f, ddt, inv_mass, k_norm, k_tang, tan_fric)
-        self._dem_substep(f, dt, inv_mass, k_norm, k_tang, tan_fric)
+        remainder = dt - n_full * ddt
+        if remainder > 0.0:
+            self._dem_substep(f, remainder, inv_mass, k_norm, k_tang, tan_fric)
 
     def substep_pre_coupling_grad(self, f):
         pass

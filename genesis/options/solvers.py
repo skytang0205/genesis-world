@@ -846,8 +846,8 @@ class DEMOptions(Options):
     ----
     DEM (Discrete Element Method) solver for simulating granular materials (sand) as spherical particles,
     following the contact model and time-stepping of the reference implementation. The solver runs its own
-    sub-substeps inside each simulator substep: a base step `ddt = radius * pi * sqrt(density / young) / 2`,
-    further clamped by the velocity-adaptive rule `ddt = min(2 * radius / (max_vel + sqrt(9.8 * 2 * radius)), ddt)`.
+    sub-substeps inside each simulator substep, with a fixed step
+    `ddt = radius * pi * sqrt(density / young) / 2 * ddt_safety`.
 
     If spatial hashing parameters are not given, they are computed automatically from `particle_size` and bounds.
 
@@ -860,7 +860,7 @@ class DEMOptions(Options):
     particle_size : float, optional
         Particle diameter in meters. Defaults to 1e-2.
     ddt_safety : float, optional
-        Safety factor applied to the DEM sub-substep `ddt = min(2 * radius / max_vel, m_ddt)`. Values below 1.0
+        Safety factor applied to the fixed DEM sub-substep `ddt = m_ddt * ddt_safety`. Values below 1.0
         deviate from the reference implementation but improve stability when many simultaneous contacts raise the
         effective stiffness beyond what the base step `m_ddt` was derived for. Defaults to 1.0.
     lower_bound : tuple, shape (3,), optional
