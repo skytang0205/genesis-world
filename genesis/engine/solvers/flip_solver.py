@@ -371,6 +371,30 @@ class FLIPSolver(Solver):
                     cell = self._func_clamp_idx(base + qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
                     qd.atomic_add(self.density[cell], w / n_per_cell)
 
+    @qd.kernel
+    def _kernel_cal_fraction(self, f: qd.i32):
+        # C++ CalFraction: deposit DEM grain volumes onto the cell grid, then
+        # target_fraction = clamp(1 - sum, 1 - 0.74 * (1 + max_ratio), 1)
+        self.target_fraction.fill(0.0)
+        dem = self._sim.dem_solver
+        n_per_cell = float(dem._particle_volume * self._inv_dx**3)
+        max_cell = qd.Vector(self.target_fraction.shape, dt=gs.qd_int) - 1
+        for i_p, i_b in qd.ndrange(dem._n_particles, self._B):
+            if dem.particles[i_p, i_b].active:
+                pfrac = n_per_cell * (1.0 + dem.particles[i_p, i_b].ratio)
+                base, frac = self._func_trilerp_weights(
+                    dem.particles[i_p, i_b].pos, qd.Vector([0.5, 0.5, 0.5])
+                )
+                for i, j, k in qd.static(qd.ndrange(2, 2, 2)):
+                    w = (frac[0] if i else 1.0 - frac[0]) * (frac[1] if j else 1.0 - frac[1]) * (
+                        frac[2] if k else 1.0 - frac[2]
+                    )
+                    cell = self._func_clamp_idx(base + qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
+                    qd.atomic_add(self.target_fraction[cell], w * pfrac)
+        for cell in qd.grouped(self.target_fraction):
+            # C++: clamp(1 - acc, 1 - 0.74 * (1 + max_ratio=0.1), 1) = clamp(1 - acc, 0.186, 1)
+            self.target_fraction[cell] = qd.min(qd.max(1.0 - self.target_fraction[cell], 0.186), 1.0)
+
     # ---------------------------------- P2G ----------------------------------
 
     @qd.kernel
@@ -553,31 +577,35 @@ class FLIPSolver(Solver):
             self.p_rhs[cell] = 0.0
             self.p_diag[cell] = 0.0
             if self.grid2mat[cell] >= 0:
-                i, j, k = cell
-                div = (
-                    self.vel_u[i + 1, j, k]
-                    - self.vel_u[i, j, k]
-                    + self.vel_v[i, j + 1, k]
-                    - self.vel_v[i, j, k]
-                    + self.vel_w[i, j, k + 1]
-                    - self.vel_w[i, j, k]
-                )
-                self.p_rhs[cell] = -div
+                f_r = self.target_fraction[cell]
+                # divergence with symmetric fraction coefficients; this sum already equals f_r * rhs_cpp
+                # (A = diag(1/f) * M with M symmetric; we solve M x = f .* rhs_cpp, same solution)
+                rhs = gs.qd_float(0.0)
                 diag = gs.qd_float(0.0)
                 for d in qd.static(range(3)):
                     for s in qd.static((-1, 1)):
                         nb = cell + qd.Vector.unit(3, d, gs.qd_int) * s
                         if self._func_in_bounds(nb, max_cell):
+                            coef = 0.5 * (f_r + self.target_fraction[nb])
+                            face_vel = gs.qd_float(0.0)
+                            if d == 0:
+                                face_vel = self.vel_u[nb if s > 0 else cell]
+                            elif d == 1:
+                                face_vel = self.vel_v[nb if s > 0 else cell]
+                            else:
+                                face_vel = self.vel_w[nb if s > 0 else cell]
+                            rhs -= s * face_vel * coef
                             if self.grid2mat[nb] >= 0:
-                                diag += 1.0
+                                diag += coef
                             else:
                                 theta = self.levelset[cell] / (self.levelset[cell] - self.levelset[nb])
-                                diag += 1.0 / max(theta, 0.001)
+                                diag += coef / max(theta, 0.001)
+                self.p_rhs[cell] = rhs
                 self.p_diag[cell] = max(diag, 1e-12)
 
     @qd.kernel
     def _kernel_projection_matvec(self, f: qd.i32):
-        # matrix-free (A x): unit-spacing Laplacian, collider-weighted, theta folded into the diagonal
+        # matrix-free (M x): symmetric fraction-weighted Laplacian (see _kernel_projection_rhs_diag)
         max_cell = qd.Vector(self.levelset.shape, dt=gs.qd_int) - 1
         for cell in qd.grouped(self.levelset):
             self.p_ap[cell] = 0.0
@@ -588,7 +616,7 @@ class FLIPSolver(Solver):
                         nb = cell + qd.Vector.unit(3, d, gs.qd_int) * s
                         if self._func_in_bounds(nb, max_cell):
                             if self.grid2mat[nb] >= 0:
-                                acc -= self.p_d[nb]
+                                acc -= self.p_d[nb] * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
                 self.p_ap[cell] = self.p_diag[cell] * self.p_d[cell] + acc
 
     @qd.kernel
@@ -604,7 +632,9 @@ class FLIPSolver(Solver):
             id0 = self.grid2mat[c0]
             id1 = self.grid2mat[c1]
             if id0 >= 0 and id1 >= 0:
+                # C++ ApplyProjection also stores the gradient (m_GradPressure1); weight == 1 inside the box domain
                 self.vel_u[idx] = self.vel_u[idx] - (self.p_x[c1] - self.p_x[c0])
+                self.grad_p_u[idx] = self.p_x[c1] - self.p_x[c0]
             elif id0 >= 0 or id1 >= 0:
                 phi0 = self.levelset[c0]
                 phi1 = self.levelset[c1]
@@ -621,7 +651,9 @@ class FLIPSolver(Solver):
             id0 = self.grid2mat[c0]
             id1 = self.grid2mat[c1]
             if id0 >= 0 and id1 >= 0:
+                # C++ ApplyProjection also stores the gradient (m_GradPressure1); weight == 1 inside the box domain
                 self.vel_v[idx] = self.vel_v[idx] - (self.p_x[c1] - self.p_x[c0])
+                self.grad_p_v[idx] = self.p_x[c1] - self.p_x[c0]
             elif id0 >= 0 or id1 >= 0:
                 phi0 = self.levelset[c0]
                 phi1 = self.levelset[c1]
@@ -638,7 +670,9 @@ class FLIPSolver(Solver):
             id0 = self.grid2mat[c0]
             id1 = self.grid2mat[c1]
             if id0 >= 0 and id1 >= 0:
+                # C++ ApplyProjection also stores the gradient (m_GradPressure1); weight == 1 inside the box domain
                 self.vel_w[idx] = self.vel_w[idx] - (self.p_x[c1] - self.p_x[c0])
+                self.grad_p_w[idx] = self.p_x[c1] - self.p_x[c0]
             elif id0 >= 0 or id1 >= 0:
                 phi0 = self.levelset[c0]
                 phi1 = self.levelset[c1]
@@ -695,18 +729,20 @@ class FLIPSolver(Solver):
             self.p_rhs[cell] = 0.0
             self.p_diag[cell] = 0.0
             if self.grid2mat[cell] >= 0:
+                f_r = self.target_fraction[cell]
                 diag = gs.qd_float(0.0)
                 is_boundary = False
                 for d in qd.static(range(3)):
                     for s in qd.static((-1, 1)):
                         nb = cell + qd.Vector.unit(3, d, gs.qd_int) * s
                         if self._func_in_bounds(nb, max_cell):
-                            diag += 1.0
+                            diag += 0.5 * (f_r + self.target_fraction[nb])
                             if self.grid2mat[nb] < 0:
                                 is_boundary = True
                 self.p_diag[cell] = max(diag, 1e-12)
                 if not is_boundary:
-                    self.p_rhs[cell] = 1.0 - qd.min(qd.max(self.density[cell], 0.5), 1.5)
+                    # C++ rhs 1 - clamp(density / f_r, .5, 1.5), times f_r (symmetrized system)
+                    self.p_rhs[cell] = f_r - qd.min(qd.max(self.density[cell], 0.5 * f_r), 1.5 * f_r)
 
     @qd.kernel
     def _kernel_correction_matvec(self, f: qd.i32):
@@ -720,7 +756,7 @@ class FLIPSolver(Solver):
                         nb = cell + qd.Vector.unit(3, d, gs.qd_int) * s
                         if self._func_in_bounds(nb, max_cell):
                             if self.grid2mat[nb] >= 0:
-                                acc -= self.p_d[nb]
+                                acc -= self.p_d[nb] * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
                 self.p_ap[cell] = self.p_diag[cell] * self.p_d[cell] + acc
 
     @qd.kernel
@@ -883,6 +919,11 @@ class FLIPSolver(Solver):
         self._kernel_reconstruct_levelset(f)
         self._kernel_set_unknowns(f)
 
+        # sand volume fraction for this water step (C++ calls CalFraction before ProjectDensity and
+        # inside ProjectVelocity; the grains do not move during a water step, so once suffices)
+        if self._dem_coupling:
+            self._kernel_cal_fraction(f)
+
         # 2. density correction (IDP)
         if self._density_correction:
             self._kernel_cal_density(f)
@@ -908,6 +949,9 @@ class FLIPSolver(Solver):
         self._kernel_enforce_velocity_boundary(f)
 
         # 5. pressure projection
+        self.grad_p_u.fill(0.0)
+        self.grad_p_v.fill(0.0)
+        self.grad_p_w.fill(0.0)
         self._kernel_projection_rhs_diag(f)
         self._pcg_solve(f, self._kernel_projection_matvec)
         self._kernel_apply_projection(f)
