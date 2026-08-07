@@ -82,6 +82,14 @@ class DEMSolver(Solver):
                 / 2.0
                 for entity in self._entities
             )
+            self._particle_volume = 4.0 / 3.0 * math.pi * self._particle_radius**3
+
+        # coupled mode: the FLIP solver drives the DEM advance per water step (C++ Advance order)
+        self._coupled = (
+            self.is_active
+            and self._sim.flip_options.dem_coupling
+            and self._sim.flip_solver.is_active
+        )
 
         # FIXME: _gravity must be a raw qd.field() -- see comment in mpm_solver.py
         if self._gravity is not None:
@@ -95,12 +103,19 @@ class DEMSolver(Solver):
             mass=gs.qd_float,
             radius=gs.qd_float,
         )
-        # dynamic state; `acc` is the C++ `AccVelocity`, assembling gravity and contact forces each sub-substep
+        # dynamic state; `acc` is the C++ `AccVelocity`, assembling gravity and contact forces each sub-substep.
+        # The wet-sand fields follow C++ DEMParticle (Particle.h); they stay zero in dry-sand mode.
         struct_particle_state = qd.types.struct(
             pos=gs.qd_vec3,
             vel=gs.qd_vec3,
             acc=gs.qd_vec3,
             active=gs.qd_bool,
+            ratio=gs.qd_float,
+            saturate_rate=gs.qd_float,
+            add_ratio=gs.qd_float,
+            add_velocity=gs.qd_vec3,
+            coupling_force=gs.qd_vec3,
+            inv_mass_eff=gs.qd_float,
         )
         # non-gradient state
         struct_particle_state_ng = qd.types.struct(
@@ -210,6 +225,12 @@ class DEMSolver(Solver):
                 self.particles[i_p, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
                 self.particles[i_p, i_b].acc = qd.Vector.zero(gs.qd_float, 3)
                 self.particles[i_p, i_b].active = True
+                self.particles[i_p, i_b].ratio = 0.0
+                self.particles[i_p, i_b].saturate_rate = 0.0
+                self.particles[i_p, i_b].add_ratio = 0.0
+                self.particles[i_p, i_b].add_velocity = qd.Vector.zero(gs.qd_float, 3)
+                self.particles[i_p, i_b].coupling_force = qd.Vector.zero(gs.qd_float, 3)
+                self.particles[i_p, i_b].inv_mass_eff = 1.0 / mass
 
     @qd.kernel
     def _kernel_reset_acc(self, f: qd.i32):
@@ -413,9 +434,12 @@ class DEMSolver(Solver):
         self._kernel_integrate(f, ddt)
 
     def substep_pre_coupling(self, f):
-        if not self.is_active:
+        if not self.is_active or self._coupled:
+            # in coupled mode the FLIP solver drives the DEM advance per water step
             return
+        self._advance(float(self._substep_dt), f)
 
+    def _material_constants(self):
         # contact stiffnesses and grain mass are global constants in C++ (m_ParticleMass, DEMForce);
         # they are taken from the (single) material here
         material = self._entities[0].material
@@ -424,17 +448,25 @@ class DEMSolver(Solver):
         k_norm = float(material.young_modulus * self._particle_radius)
         k_tang = float(k_norm * material.poisson_ratio)
         tan_fric = float(math.tan(material.friction_angle))
+        return inv_mass, k_norm, k_tang, tan_fric
 
+    def _advance(self, dt_total, f):
         # fixed sub-substep (the reference's velocity-adaptive clamp is removed by user decision):
-        # as many full `ddt` steps as fit into the simulator substep, plus one remainder step
+        # as many full `ddt` steps as fit into dt_total, plus one remainder step
+        inv_mass, k_norm, k_tang, tan_fric = self._material_constants()
         ddt = self._m_ddt * self._ddt_safety
-        dt = float(self._substep_dt)
-        n_full = int(dt / ddt)
+        n_full = int(dt_total / ddt)
         for _ in range(n_full):
             self._dem_substep(f, ddt, inv_mass, k_norm, k_tang, tan_fric)
-        remainder = dt - n_full * ddt
+        remainder = dt_total - n_full * ddt
         if remainder > 0.0:
             self._dem_substep(f, remainder, inv_mass, k_norm, k_tang, tan_fric)
+
+    def advance_coupled(self, f, dt_f):
+        # C++ MoveDEMParticles(dt_f): fresh fluid density, then the ddt sub-substep loop whose
+        # total duration is exactly dt_f (called by the FLIP solver before each water step)
+        self._sim.flip_solver._kernel_cal_density(f)
+        self._advance(dt_f, f)
 
     def substep_pre_coupling_grad(self, f):
         pass

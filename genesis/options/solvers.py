@@ -954,6 +954,10 @@ class FLIPOptions(Options):
         density-correction systems (the reference uses AMGCL). Defaults to 200.
     pcg_tol : float, optional
         Relative residual tolerance of the PCG solver. Defaults to 1e-4.
+    dem_coupling : bool, optional
+        Whether to two-way couple with the DEM solver (sand) when one is active: sand grains feel pressure
+        gradient / added-mass / drag forces and absorb water; the fluid sees the grains' displaced volume and
+        the coupling reaction force. Disable for a pure-water scene to skip all coupling work. Defaults to True.
     """
 
     dt: PositiveFloat | None = None
@@ -969,6 +973,7 @@ class FLIPOptions(Options):
 
     pcg_max_iter: PositiveInt = 200
     pcg_tol: PositiveFloat = 1e-4
+    dem_coupling: StrictBool = True
 
 
 class FEMOptions(Options):

@@ -77,6 +77,26 @@ class FLIPSolver(Solver):
             for entity in self._entities:
                 entity._add_to_solver()
 
+        # coupled mode: drive the DEM advance before each water step (C++ Advance order)
+        self._dem_coupling = (
+            self.is_active and self._sim.flip_options.dem_coupling and self._sim.dem_solver.is_active
+        )
+        if self.is_active:
+            self.target_fraction.fill(1.0)
+        # C++ m_LastDeltaTime = 1000000 (first-step coupling forces vanish)
+        self._last_dt = 1e6
+        if self._dem_coupling:
+            # C++ m_single_ratio = 1 / floor(V_dem / dx^3 * NumPartPerCell)
+            dem = self._sim.dem_solver
+            n_absorbable = int(dem._particle_volume / self._dx**3 * self._seed_sub_factor**3)
+            if n_absorbable < 1:
+                gs.raise_exception(
+                    "DEM grains are too small relative to the FLIP cell for water absorption: "
+                    f"floor(V_dem/dx^3 * {self._seed_sub_factor}^3) = 0 "
+                    f"(V_dem={dem._particle_volume:.3e}, dx={self._dx:.4f}). Increase grid_res or particle_size."
+                )
+            self._single_ratio = 1.0 / n_absorbable
+
         # FIXME: _gravity must be a raw qd.field() -- see comment in mpm_solver.py
         if self._gravity is not None:
             gravity = self._gravity.to_numpy()
@@ -121,11 +141,24 @@ class FLIPSolver(Solver):
         self.mark_u = qd.field(gs.qd_int, shape=shape_u)
         self.mark_v = qd.field(gs.qd_int, shape=shape_v)
         self.mark_w = qd.field(gs.qd_int, shape=shape_w)
+        # sand-coupling face fields (C++ m_CouplingForce / m_Pressure.GetGradPressure1())
+        self.coupling_force_u = qd.field(gs.qd_float, shape=shape_u)
+        self.coupling_force_v = qd.field(gs.qd_float, shape=shape_v)
+        self.coupling_force_w = qd.field(gs.qd_float, shape=shape_w)
+        self.grad_p_u = qd.field(gs.qd_float, shape=shape_u)
+        self.grad_p_v = qd.field(gs.qd_float, shape=shape_v)
+        self.grad_p_w = qd.field(gs.qd_float, shape=shape_w)
 
         shape_c = (Nx, Ny, Nz)
         self.levelset = qd.field(gs.qd_float, shape=shape_c)
         self.density = qd.field(gs.qd_float, shape=shape_c)
         self.grid2mat = qd.field(gs.qd_int, shape=shape_c)
+        # sand-coupling fields (C++ m_TargetFraction / m_NeededRatio / m_AbsorbRatio / m_AbsorbVelocity)
+        self.target_fraction = qd.field(gs.qd_float, shape=shape_c)
+        self.needed_ratio = qd.field(gs.qd_float, shape=shape_c)
+        self.absorb_ratio = qd.field(gs.qd_float, shape=shape_c)
+        self.absorb_vel = qd.Vector.field(3, gs.qd_float, shape=shape_c)
+        self.absorb_count = qd.field(gs.qd_int, shape=shape_c)
         # PCG vectors
         self.p_x = qd.field(gs.qd_float, shape=shape_c)
         self.p_r = qd.field(gs.qd_float, shape=shape_c)
@@ -837,6 +870,9 @@ class FLIPSolver(Solver):
             self._kernel_max_face_vel(max_vel)
             cfl_dt = 2.0 * self._dx / max(float(max_vel[0]), 1e-12)
             dt_f = min(cfl_dt, dt_remaining)
+            if self._dem_coupling:
+                # C++ Advance: MoveDEMParticles(dt_f) runs before the water path of each fluid step
+                self._sim.dem_solver.advance_coupled(f, dt_f)
             self._water_step(f, dt_f)
             dt_remaining -= dt_f
 
@@ -883,6 +919,9 @@ class FLIPSolver(Solver):
 
         # 6. G2P (FLIP/PIC blend)
         self._kernel_g2p(f)
+
+        # C++ m_LastDeltaTime = deltaTime at the end of Advance
+        self._last_dt = dt
 
     def substep_pre_coupling_grad(self, f):
         pass
