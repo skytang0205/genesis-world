@@ -60,6 +60,8 @@ class FLIPSolver(Solver):
 
         # reference: m_ParticleRadFactor = 1.01 * sqrt(3) / 2
         self._particle_rad = 1.01 * math.sqrt(3.0) / 2.0 * self._dx
+        # C++ m_ViscosityCoeff = 1 (quadratic drag on sand grains)
+        self._viscosity_coeff = 1.0
 
         # used for the entity seeding bounds check only
         self.boundary = CubeBoundary(lower=self._lower_bound, upper=self._upper_bound)
@@ -543,14 +545,19 @@ class FLIPSolver(Solver):
 
     @qd.kernel
     def _kernel_apply_gravity(self, f: qd.i32, dt: qd.f32):
-        # C++ ApplyBodyForces: gravity on faces (coupling term is zero until the coupling phase)
+        # C++ ApplyBodyForces: gravity plus the coupling reaction force (v -= F * dt / dx^3);
+        # the coupling fields are zero in uncoupled mode, keeping this bit-identical
         g = self._gravity[0]
+        inv_cell_vol = self._inv_dx**3
         for idx in qd.grouped(self.vel_u):
-            self.vel_u[idx] = self.vel_u[idx] + g[0] * dt
+            self.vel_u[idx] = self.vel_u[idx] + g[0] * dt - self.coupling_force_u[idx] * dt * inv_cell_vol
         for idx in qd.grouped(self.vel_v):
-            self.vel_v[idx] = self.vel_v[idx] + g[1] * dt
+            self.vel_v[idx] = self.vel_v[idx] + g[1] * dt - self.coupling_force_v[idx] * dt * inv_cell_vol
         for idx in qd.grouped(self.vel_w):
-            self.vel_w[idx] = self.vel_w[idx] + g[2] * dt
+            self.vel_w[idx] = self.vel_w[idx] + g[2] * dt - self.coupling_force_w[idx] * dt * inv_cell_vol
+        self.coupling_force_u.fill(0.0)
+        self.coupling_force_v.fill(0.0)
+        self.coupling_force_w.fill(0.0)
 
     @qd.kernel
     def _kernel_enforce_velocity_boundary(self, f: qd.i32):

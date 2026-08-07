@@ -257,7 +257,6 @@ class DEMSolver(Solver):
         j: qd.i32,
         i_b: qd.i32,
         particle_radius: qd.f32,
-        inv_mass: qd.f32,
         k_norm: qd.f32,
         k_tang: qd.f32,
         tan_fric: qd.f32,
@@ -284,15 +283,16 @@ class DEMSolver(Solver):
                     f_shear *= max_fs / fs_norm
 
                 f = -f_normal - f_shear
-                # C++ divides by (m + ratio * V); ratio == 0 for dry sand
-                self.particles_reordered[i, i_b].acc = self.particles_reordered[i, i_b].acc + f * inv_mass
+                # C++ divides by the wet mass (m + ratio * V); inv_mass_eff == 1/m in dry-sand mode
+                self.particles_reordered[i, i_b].acc = (
+                    self.particles_reordered[i, i_b].acc + f * self.particles_reordered[i, i_b].inv_mass_eff
+                )
 
     @qd.kernel
     def _kernel_contact_forces(
         self,
         f: qd.i32,
         particle_radius: qd.f32,
-        inv_mass: qd.f32,
         k_norm: qd.f32,
         k_tang: qd.f32,
         tan_fric: qd.f32,
@@ -307,7 +307,7 @@ class DEMSolver(Solver):
                         self.sh.slot_size[slot_idx, i_b] + self.sh.slot_start[slot_idx, i_b],
                     ):
                         if i_p != j and self.particles_reordered[j, i_b].active:
-                            self._func_contact_force(i_p, j, i_b, particle_radius, inv_mass, k_norm, k_tang, tan_fric)
+                            self._func_contact_force(i_p, j, i_b, particle_radius, k_norm, k_tang, tan_fric)
 
     @qd.kernel
     def _kernel_copy_acc_from_reordered(self, f: qd.i32):
@@ -424,10 +424,169 @@ class DEMSolver(Solver):
     def process_input_grad(self):
         pass
 
+    # ------------------------------------------------------------------------------------
+    # --------------------------- coupled mode (C++ GIC coupling) ------------------------
+    # ------------------------------------------------------------------------------------
+
+    @qd.func
+    def _func_sample_flip_faces(self, pos, fu: qd.template(), fv: qd.template(), fw: qd.template()):
+        # trilinear sample of a FLIP MAC face field triple at pos (same staggering as FLIP p2g)
+        flip = self._sim.flip_solver
+        vel = qd.Vector.zero(gs.qd_float, 3)
+        for axis in qd.static(range(3)):
+            offsets = qd.Vector([0.5, 0.5, 0.5])
+            offsets[axis] = 0.0
+            rel = (pos - flip._lower_v) * flip._inv_dx - offsets
+            base = qd.floor(rel, gs.qd_int)
+            frac = rel - base
+            val = gs.qd_float(0.0)
+            for i, j, k in qd.static(qd.ndrange(2, 2, 2)):
+                w = (frac[0] if i else 1.0 - frac[0]) * (frac[1] if j else 1.0 - frac[1]) * (
+                    frac[2] if k else 1.0 - frac[2]
+                )
+                idx = base + qd.Vector([i, j, k], dt=gs.qd_int)
+                if axis == 0:
+                    idx = self._func_clamp_flip_idx(idx, qd.Vector(fu.shape, dt=gs.qd_int) - 1)
+                    val += fu[idx] * w
+                elif axis == 1:
+                    idx = self._func_clamp_flip_idx(idx, qd.Vector(fv.shape, dt=gs.qd_int) - 1)
+                    val += fv[idx] * w
+                else:
+                    idx = self._func_clamp_flip_idx(idx, qd.Vector(fw.shape, dt=gs.qd_int) - 1)
+                    val += fw[idx] * w
+            vel[axis] = val
+        return vel
+
+    @qd.func
+    def _func_clamp_flip_idx(self, idx, max_idx):
+        return qd.Vector(
+            [
+                qd.min(qd.max(idx[0], 0), max_idx[0]),
+                qd.min(qd.max(idx[1], 0), max_idx[1]),
+                qd.min(qd.max(idx[2], 0), max_idx[2]),
+            ],
+            dt=gs.qd_int,
+        )
+
+    @qd.func
+    def _func_sample_flip_cell(self, pos, field: qd.template()):
+        # trilinear sample of a FLIP cell-centered scalar field at pos
+        flip = self._sim.flip_solver
+        rel = (pos - flip._lower_v) * flip._inv_dx - 0.5
+        base = qd.floor(rel, gs.qd_int)
+        frac = rel - base
+        val = gs.qd_float(0.0)
+        max_cell = qd.Vector(field.shape, dt=gs.qd_int) - 1
+        for i, j, k in qd.static(qd.ndrange(2, 2, 2)):
+            w = (frac[0] if i else 1.0 - frac[0]) * (frac[1] if j else 1.0 - frac[1]) * (
+                frac[2] if k else 1.0 - frac[2]
+            )
+            cell = self._func_clamp_flip_idx(base + qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
+            val += field[cell] * w
+        return val
+
+    @qd.kernel
+    def _kernel_update_saturate_rate(self, f: qd.i32):
+        # C++ MoveDEMParticlesSplit: SaturateRate = clamp(ratio + den / (1 - den), 0, 1)
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                den = self._func_sample_flip_cell(
+                    self.particles[i_p, i_b].pos, self._sim.flip_solver.density
+                )
+                self.particles[i_p, i_b].saturate_rate = qd.min(
+                    qd.max(self.particles[i_p, i_b].ratio + den / (1.0 - den), 0.0), 1.0
+                )
+
+    @qd.kernel
+    def _kernel_cal_coupling(self, f: qd.i32):
+        # C++ CalCoupling (alg2): pressure gradient + relative acceleration (added mass) + quadratic drag,
+        # applied only inside the fluid (levelset <= 0)
+        flip = self._sim.flip_solver
+        V = gs.qd_float(self._particle_volume)
+        r = gs.qd_float(self._particle_radius)
+        inv_dt = gs.qd_float(1.0 / flip._last_dt)
+        visc = gs.qd_float(flip._viscosity_coeff)
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                pos = self.particles[i_p, i_b].pos
+                if self._func_sample_flip_cell(pos, flip.levelset) <= 0.0:
+                    ratio = self.particles[i_p, i_b].ratio
+                    grad_p = self._func_sample_flip_faces(pos, flip.grad_p_u, flip.grad_p_v, flip.grad_p_w)
+                    vdiff = self._func_sample_flip_faces(pos, flip.vdiff_u, flip.vdiff_v, flip.vdiff_w)
+                    v_grid = self._func_sample_flip_faces(pos, flip.vel_u, flip.vel_v, flip.vel_w)
+                    cf = self.particles[i_p, i_b].coupling_force
+                    cf -= grad_p * (inv_dt * V * (1.0 + ratio))
+                    cf += (vdiff * inv_dt - self.particles[i_p, i_b].acc) * (V * 0.5 * (1.0 + ratio))
+                    dv = v_grid - self.particles[i_p, i_b].vel
+                    cf += dv * dv.norm() * (12.0 * 3.141592653589793 * r * r * visc)
+                    self.particles[i_p, i_b].coupling_force = cf
+
+    @qd.kernel
+    def _kernel_reset_acc_coupled(self, f: qd.i32, dt_f: qd.f32):
+        # C++ ApplyDEMForces: gravity (not mass-scaled) + (coupling + absorbed-water impulse) / (m + ratio*V)
+        V = gs.qd_float(self._particle_volume)
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                ratio = self.particles[i_p, i_b].ratio
+                inv_mass_eff = 1.0 / (self.particles_info[i_p].mass + ratio * V)
+                self.particles[i_p, i_b].inv_mass_eff = inv_mass_eff
+                absorb = self.particles[i_p, i_b].add_velocity * (
+                    self.particles[i_p, i_b].add_ratio * V / dt_f
+                )
+                self.particles[i_p, i_b].acc = self._gravity[i_b] + (
+                    self.particles[i_p, i_b].coupling_force + absorb
+                ) * inv_mass_eff
+
+    @qd.kernel
+    def _kernel_transfer_coupling_forces(self, f: qd.i32, ddt: qd.f32, dt_f: qd.f32):
+        # C++ TransferCouplingForces: trilinear scatter to the MAC faces, scaled by ddt / dt_f
+        # (no weight-sum normalization, as in the reference), then clear the particle force
+        flip = self._sim.flip_solver
+        scale = ddt / dt_f
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                pos = self.particles[i_p, i_b].pos
+                cf = self.particles[i_p, i_b].coupling_force
+                for axis in qd.static(range(3)):
+                    offsets = qd.Vector([0.5, 0.5, 0.5])
+                    offsets[axis] = 0.0
+                    rel = (pos - flip._lower_v) * flip._inv_dx - offsets
+                    base = qd.floor(rel, gs.qd_int)
+                    frac = rel - base
+                    for i, j, k in qd.static(qd.ndrange(2, 2, 2)):
+                        w = (frac[0] if i else 1.0 - frac[0]) * (frac[1] if j else 1.0 - frac[1]) * (
+                            frac[2] if k else 1.0 - frac[2]
+                        )
+                        idx = base + qd.Vector([i, j, k], dt=gs.qd_int)
+                        if axis == 0:
+                            idx = self._func_clamp_flip_idx(idx, qd.Vector(flip.coupling_force_u.shape, dt=gs.qd_int) - 1)
+                            qd.atomic_add(flip.coupling_force_u[idx], cf[0] * w * scale)
+                        elif axis == 1:
+                            idx = self._func_clamp_flip_idx(idx, qd.Vector(flip.coupling_force_v.shape, dt=gs.qd_int) - 1)
+                            qd.atomic_add(flip.coupling_force_v[idx], cf[1] * w * scale)
+                        else:
+                            idx = self._func_clamp_flip_idx(idx, qd.Vector(flip.coupling_force_w.shape, dt=gs.qd_int) - 1)
+                            qd.atomic_add(flip.coupling_force_w[idx], cf[2] * w * scale)
+                self.particles[i_p, i_b].coupling_force = qd.Vector.zero(gs.qd_float, 3)
+
+    def _dem_substep_coupled(self, f, ddt, dt_f, k_norm, k_tang, tan_fric):
+        # C++ MoveDEMParticlesSplit (coupled): saturate rate, coupling force (reads the previous
+        # sub-substep's acc), force assembly, contact, reaction scatter, collider, integrate
+        self._kernel_update_saturate_rate(f)
+        self._kernel_cal_coupling(f)
+        self._kernel_reset_acc_coupled(f, dt_f)
+        self._kernel_reorder_particles(f)
+        self._kernel_contact_forces(f, self._particle_radius, k_norm, k_tang, tan_fric)
+        self._kernel_copy_acc_from_reordered(f)
+        self._kernel_transfer_coupling_forces(f, ddt, dt_f)
+        self._kernel_move_obstacle(ddt)
+        self._kernel_enforce_boundary(f, self._particle_radius, tan_fric)
+        self._kernel_integrate(f, ddt)
+
     def _dem_substep(self, f, ddt, inv_mass, k_norm, k_tang, tan_fric):
         self._kernel_reset_acc(f)
         self._kernel_reorder_particles(f)
-        self._kernel_contact_forces(f, self._particle_radius, inv_mass, k_norm, k_tang, tan_fric)
+        self._kernel_contact_forces(f, self._particle_radius, k_norm, k_tang, tan_fric)
         self._kernel_copy_acc_from_reordered(f)
         self._kernel_move_obstacle(ddt)
         self._kernel_enforce_boundary(f, self._particle_radius, tan_fric)
@@ -466,7 +625,14 @@ class DEMSolver(Solver):
         # C++ MoveDEMParticles(dt_f): fresh fluid density, then the ddt sub-substep loop whose
         # total duration is exactly dt_f (called by the FLIP solver before each water step)
         self._sim.flip_solver._kernel_cal_density(f)
-        self._advance(dt_f, f)
+        inv_mass, k_norm, k_tang, tan_fric = self._material_constants()
+        ddt = self._m_ddt * self._ddt_safety
+        n_full = int(dt_f / ddt)
+        for _ in range(n_full):
+            self._dem_substep_coupled(f, ddt, dt_f, k_norm, k_tang, tan_fric)
+        remainder = dt_f - n_full * ddt
+        if remainder > 0.0:
+            self._dem_substep_coupled(f, remainder, dt_f, k_norm, k_tang, tan_fric)
 
     def substep_pre_coupling_grad(self, f):
         pass
