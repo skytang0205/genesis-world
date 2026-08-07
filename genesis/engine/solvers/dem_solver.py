@@ -31,6 +31,9 @@ class DEMSolver(Solver):
       trigger zone `phi < 0.5 * radius`; projection `x -= n * phi` and velocity reflection
       `v -= 1.5 * (v . n) * n` when `phi < 0`; wall friction `a += (a . n) * tan(friction_angle) * t_hat`
       on the acceleration when `a . n < 0`, where `t_hat` is the normalized tangential velocity.
+    - Moving box obstacle (optional): same enforcement as the domain collider, but with the particle
+      velocity replaced by the velocity relative to the obstacle (`delta_vel` in the C++ code), so a
+      moving obstacle drags/scoops grains via the restitution and friction terms.
 
     The capillary (liquid-bridge) cohesion of the reference is identically zero for dry sand
     (its coefficient vanishes at zero saturation) and is therefore omitted until the wet-sand coupling phase.
@@ -117,6 +120,12 @@ class DEMSolver(Solver):
             shape=(self._n_particles, self._B), layout=qd.Layout.SOA
         )
 
+        # optional moving box obstacle (disabled by default); see set_box_obstacle
+        self.obstacle_pos = qd.field(gs.qd_vec3, shape=(self._B,))
+        self.obstacle_vel = qd.field(gs.qd_vec3, shape=(self._B,))
+        self.obstacle_half = qd.field(gs.qd_vec3, shape=(self._B,))
+        self.obstacle_enabled = qd.field(gs.qd_int, shape=(self._B,))
+
     @property
     def is_active(self):
         return self.n_particles > 0
@@ -135,6 +144,47 @@ class DEMSolver(Solver):
         )
         self._entities.append(entity)
         return entity
+
+    # ------------------------------------------------------------------------------------
+    # --------------------------------- moving obstacle ----------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @gs.assert_built
+    def set_box_obstacle(self, half_extents, pos, vel=(0.0, 0.0, 0.0)):
+        """
+        Place (or replace) the moving box obstacle and enable it.
+
+        The obstacle position is advanced internally by `vel * ddt` at every DEM sub-substep, so the
+        obstacle motion is continuous at the contact timescale; per-frame teleportation would kick the
+        resting grains. Use `set_box_obstacle_vel` to change the velocity during the simulation.
+
+        Parameters
+        ----------
+        half_extents : tuple, shape (3,)
+            Half extents of the box in meters.
+        pos : tuple, shape (3,)
+            Center of the box in meters.
+        vel : tuple, shape (3,), optional
+            Velocity of the box in m/s. Defaults to zero.
+        """
+        self.obstacle_half.from_numpy(np.tile(np.asarray(half_extents, dtype=gs.np_float), (self._B, 1)))
+        self.obstacle_enabled.from_numpy(np.ones((self._B,), dtype=gs.np_int))
+        self.obstacle_pos.from_numpy(np.tile(np.asarray(pos, dtype=gs.np_float), (self._B, 1)))
+        self.obstacle_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
+
+    @gs.assert_built
+    def set_box_obstacle_vel(self, vel):
+        """
+        Set the velocity of the moving box obstacle. Its position is advanced internally every DEM sub-substep.
+        """
+        self.obstacle_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
+
+    @gs.assert_built
+    def get_box_obstacle_pos(self):
+        """
+        Current center position of the moving box obstacle (per env, shape (n_envs, 3)).
+        """
+        return self.obstacle_pos.to_numpy()
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------- kernels --------------------------------------
@@ -247,14 +297,15 @@ class DEMSolver(Solver):
 
     @qd.kernel
     def _kernel_enforce_boundary(self, f: qd.i32, particle_radius: qd.f32, tan_fric: qd.f32):
-        # C++ Collider::Enforce(DEMParticles, ddt, radius) for a static box domain;
-        # phi is the signed distance to the domain box, positive inside
+        # C++ Collider::Enforce(DEMParticles, ddt, radius): domain box (static, phi positive inside) plus an
+        # optional moving box obstacle (relative velocity delta_vel = v - v_obstacle, as in the C++ code)
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             if self.particles[i_p, i_b].active:
                 pos = self.particles[i_p, i_b].pos
                 vel = self.particles[i_p, i_b].vel
                 acc = self.particles[i_p, i_b].acc
 
+                # domain box
                 phi = gs.qd_float(1e30)
                 n = qd.Vector.zero(gs.qd_float, 3)
                 for i_a in qd.static(range(3)):
@@ -281,9 +332,51 @@ class DEMSolver(Solver):
                         if vt_norm > gs.EPS:
                             acc = acc + acc_n * tan_fric * vel_tangential / vt_norm
 
-                    self.particles[i_p, i_b].pos = pos
-                    self.particles[i_p, i_b].vel = vel
-                    self.particles[i_p, i_b].acc = acc
+                # moving box obstacle
+                if self.obstacle_enabled[i_b] == 1:
+                    rel = pos - self.obstacle_pos[i_b]
+                    half = self.obstacle_half[i_b]
+                    qx = abs(rel[0]) - half[0]
+                    qy = abs(rel[1]) - half[1]
+                    qz = abs(rel[2]) - half[2]
+                    q_pos = qd.Vector([max(qx, 0.0), max(qy, 0.0), max(qz, 0.0)])
+                    phi_obs = q_pos.norm() + min(max(qx, max(qy, qz)), 0.0)
+
+                    if phi_obs < 0.5 * particle_radius:
+                        # outside: exact SDF gradient; inside: dominant-axis face normal
+                        n_obs = qd.Vector.zero(gs.qd_float, 3)
+                        if phi_obs > 0.0:
+                            n_obs = q_pos / phi_obs
+                        elif qx >= qy and qx >= qz:
+                            n_obs[0] = 1.0 if rel[0] >= 0.0 else -1.0
+                        elif qy >= qz:
+                            n_obs[1] = 1.0 if rel[1] >= 0.0 else -1.0
+                        else:
+                            n_obs[2] = 1.0 if rel[2] >= 0.0 else -1.0
+
+                        delta_vel = vel - self.obstacle_vel[i_b]
+                        if phi_obs < 0.0:
+                            pos = pos - n_obs * phi_obs
+                            dv_n = delta_vel.dot(n_obs)
+                            if dv_n < 0.0:
+                                vel = vel - 1.5 * dv_n * n_obs
+                        acc_n = acc.dot(n_obs)
+                        if acc_n < 0.0:
+                            dv_tangential = delta_vel - delta_vel.dot(n_obs) * n_obs
+                            vt_norm = dv_tangential.norm()
+                            if vt_norm > gs.EPS:
+                                acc = acc + acc_n * tan_fric * dv_tangential / vt_norm
+
+                self.particles[i_p, i_b].pos = pos
+                self.particles[i_p, i_b].vel = vel
+                self.particles[i_p, i_b].acc = acc
+
+    @qd.kernel
+    def _kernel_move_obstacle(self, ddt: qd.f32):
+        # continuous obstacle motion at the DEM sub-substep timescale (see set_box_obstacle)
+        for i_b in range(self._B):
+            if self.obstacle_enabled[i_b] == 1:
+                self.obstacle_pos[i_b] = self.obstacle_pos[i_b] + self.obstacle_vel[i_b] * ddt
 
     @qd.kernel
     def _kernel_integrate(self, f: qd.i32, ddt: qd.f32):
@@ -315,6 +408,7 @@ class DEMSolver(Solver):
         self._kernel_reorder_particles(f)
         self._kernel_contact_forces(f, self._particle_radius, inv_mass, k_norm, k_tang, tan_fric)
         self._kernel_copy_acc_from_reordered(f)
+        self._kernel_move_obstacle(ddt)
         self._kernel_enforce_boundary(f, self._particle_radius, tan_fric)
         self._kernel_integrate(f, ddt)
 
