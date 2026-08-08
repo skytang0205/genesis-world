@@ -597,9 +597,14 @@ class DEMSolver(Solver):
     @qd.kernel
     def _kernel_transfer_coupling_forces(self, f: qd.i32, ddt: qd.f32, dt_f: qd.f32):
         # C++ TransferCouplingForces: trilinear scatter to the MAC faces, scaled by ddt / dt_f
-        # (no weight-sum normalization, as in the reference), then clear the particle force
+        # (no weight-sum normalization, as in the reference), then clear the particle force.
+        # Semi-implicit addition (recorded deviation): the same kick (-cf * w * ddt / dx^3) is also
+        # applied immediately to the current grid velocity, so the drag sampled by later
+        # sub-substeps sees the already-corrected water velocity and the explicit reaction does
+        # not overshoot. The accumulated force is still applied once after P2G, as in C++.
         flip = self._sim.flip_solver
         scale = ddt / dt_f
+        kick = ddt * flip._inv_dx**3
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             if self.particles[i_p, i_b].active:
                 pos = self.particles[i_p, i_b].pos
@@ -618,12 +623,15 @@ class DEMSolver(Solver):
                         if axis == 0:
                             idx = self._func_clamp_flip_idx(idx, qd.Vector(flip.coupling_force_u.shape, dt=gs.qd_int) - 1)
                             qd.atomic_add(flip.coupling_force_u[idx], cf[0] * w * scale)
+                            qd.atomic_add(flip.vel_u[idx], -cf[0] * w * kick)
                         elif axis == 1:
                             idx = self._func_clamp_flip_idx(idx, qd.Vector(flip.coupling_force_v.shape, dt=gs.qd_int) - 1)
                             qd.atomic_add(flip.coupling_force_v[idx], cf[1] * w * scale)
+                            qd.atomic_add(flip.vel_v[idx], -cf[1] * w * kick)
                         else:
                             idx = self._func_clamp_flip_idx(idx, qd.Vector(flip.coupling_force_w.shape, dt=gs.qd_int) - 1)
                             qd.atomic_add(flip.coupling_force_w[idx], cf[2] * w * scale)
+                            qd.atomic_add(flip.vel_w[idx], -cf[2] * w * kick)
                 self.particles[i_p, i_b].coupling_force = qd.Vector.zero(gs.qd_float, 3)
 
     def _dem_substep_coupled(self, f, ddt, dt_f, k_norm, k_tang, tan_fric):
