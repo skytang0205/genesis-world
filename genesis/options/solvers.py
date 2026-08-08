@@ -863,6 +863,9 @@ class DEMOptions(Options):
         Safety factor applied to the fixed DEM sub-substep `ddt = m_ddt * ddt_safety`. Values below 1.0
         deviate from the reference implementation but improve stability when many simultaneous contacts raise the
         effective stiffness beyond what the base step `m_ddt` was derived for. Defaults to 1.0.
+    cylinder_radius : float, optional
+        If set, an additional static hollow-cylinder collider (axis along z through the domain center) confines
+        the grains, following the reference's rotate-scene boundary. Defaults to None (box domain only).
     lower_bound : tuple, shape (3,), optional
         Lower bound of the simulation domain. The domain walls act as a static box collider for the particles.
         Defaults to (-1.0, -1.0, 0.0).
@@ -881,6 +884,8 @@ class DEMOptions(Options):
     particle_size: PositiveFloat = 1e-2
 
     ddt_safety: PositiveFloat = 1.0
+
+    cylinder_radius: PositiveFloat | None = None
 
     # spatial hashing
     hash_grid_res: Vec3FType | None = None  # size of the spatially-repetitive hash grid in meters
@@ -958,6 +963,15 @@ class FLIPOptions(Options):
         Whether to two-way couple with the DEM solver (sand) when one is active: sand grains feel pressure
         gradient / added-mass / drag forces and absorb water; the fluid sees the grains' displaced volume and
         the coupling reaction force. Disable for a pure-water scene to skip all coupling work. Defaults to True.
+    cylinder_radius : float, optional
+        If set, an additional static hollow-cylinder collider (axis along z through the domain center) confines
+        the fluid and grains, following the reference's rotate-scene boundary. Defaults to None (box domain only).
+    rotate_omega : float, optional
+        Angular velocity in rad/s of the C++ rotate-scene drive: while `t < rotate_duration`, fluid faces in
+        sand-free cells (target fraction >= 0.8) receive the rigid-body rotation increment `omega x r * dt`.
+        Defaults to 0.0 (off).
+    rotate_duration : float, optional
+        Duration in seconds of the rotation drive. Defaults to 2.0, matching the reference.
     """
 
     dt: PositiveFloat | None = None
@@ -974,6 +988,10 @@ class FLIPOptions(Options):
     pcg_max_iter: PositiveInt = 200
     pcg_tol: PositiveFloat = 1e-4
     dem_coupling: StrictBool = True
+
+    cylinder_radius: PositiveFloat | None = None
+    rotate_omega: float = 0.0
+    rotate_duration: PositiveFloat = 2.0
 
 
 class FEMOptions(Options):

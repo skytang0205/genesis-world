@@ -63,6 +63,13 @@ class FLIPSolver(Solver):
         # C++ m_ViscosityCoeff = 1 (quadratic drag on sand grains)
         self._viscosity_coeff = 1.0
 
+        self._cylinder_radius = options.cylinder_radius
+        self._has_cylinder = options.cylinder_radius is not None
+        self._rotate_omega = options.rotate_omega
+        self._rotate_duration = options.rotate_duration
+        self._center_x = 0.5 * float(self._lower_bound[0] + self._upper_bound[0])
+        self._center_y = 0.5 * float(self._lower_bound[1] + self._upper_bound[1])
+
         # used for the entity seeding bounds check only
         self.boundary = CubeBoundary(lower=self._lower_bound, upper=self._upper_bound)
 
@@ -78,6 +85,7 @@ class FLIPSolver(Solver):
             self.init_fields()
             for entity in self._entities:
                 entity._add_to_solver()
+            self._build_open_masks()
 
         # coupled mode: drive the DEM advance before each water step (C++ Advance order)
         self._dem_coupling = (
@@ -143,6 +151,10 @@ class FLIPSolver(Solver):
         self.mark_u = qd.field(gs.qd_int, shape=shape_u)
         self.mark_v = qd.field(gs.qd_int, shape=shape_v)
         self.mark_w = qd.field(gs.qd_int, shape=shape_w)
+        # per-face open masks: 0 on solid faces (box boundary and, if enabled, outside the cylinder)
+        self.open_u = qd.field(gs.qd_float, shape=shape_u)
+        self.open_v = qd.field(gs.qd_float, shape=shape_v)
+        self.open_w = qd.field(gs.qd_float, shape=shape_w)
         # sand-coupling face fields (C++ m_CouplingForce / m_Pressure.GetGradPressure1())
         self.coupling_force_u = qd.field(gs.qd_float, shape=shape_u)
         self.coupling_force_v = qd.field(gs.qd_float, shape=shape_v)
@@ -201,6 +213,30 @@ class FLIPSolver(Solver):
         )
         self._entities.append(entity)
         return entity
+
+    def _build_open_masks(self):
+        # open == 1 on faces strictly inside the domain box and (if enabled) the cylinder; 0 on solid faces
+        R = self._cylinder_radius
+        lo = self._lower_bound
+        for axis, (field, shape) in enumerate(
+            [(self.open_u, self.open_u.shape), (self.open_v, self.open_v.shape), (self.open_w, self.open_w.shape)]
+        ):
+            offsets = np.array([0.5, 0.5, 0.5])
+            offsets[axis] = 0.0
+            grids = np.meshgrid(
+                *(np.arange(n) for n in shape), indexing="ij"
+            )
+            pos = lo[None, None, None, :] + (np.stack(grids, axis=-1) + offsets) * self._dx
+            open_mask = np.ones(shape, dtype=gs.np_float)
+            # box boundary faces are solid
+            on_box = np.zeros(shape, dtype=bool)
+            on_box |= np.isclose(pos[..., axis], lo[axis])
+            on_box |= np.isclose(pos[..., axis], self._upper_bound[axis])
+            open_mask[on_box] = 0.0
+            if R is not None:
+                rr2 = (pos[..., 0] - self._center_x) ** 2 + (pos[..., 1] - self._center_y) ** 2
+                open_mask[rr2 > R * R] = 0.0
+            field.from_numpy(np.ascontiguousarray(open_mask))
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- grid helpers -------------------------------------
@@ -264,6 +300,23 @@ class FLIPSolver(Solver):
         return vel
 
     @qd.func
+    def _func_boundary_phi_normal(self, pos):
+        # combined domain boundary: box intersected with the (optional) z-axis cylinder
+        phi, n = self._func_box_phi_normal(pos)
+        if qd.static(self._has_cylinder):
+            dx_ = pos[0] - self._center_x
+            dy_ = pos[1] - self._center_y
+            rho = qd.sqrt(dx_ * dx_ + dy_ * dy_)
+            phi_c = self._cylinder_radius - rho
+            if phi_c < phi:
+                phi = phi_c
+                n = qd.Vector.zero(gs.qd_float, 3)
+                if rho > gs.EPS:
+                    n[0] = -dx_ / rho
+                    n[1] = -dy_ / rho
+        return phi, n
+
+    @qd.func
     def _func_box_phi_normal(self, pos):
         # signed distance (positive inside) and inward normal of the domain box
         phi = gs.qd_float(1e30)
@@ -308,7 +361,7 @@ class FLIPSolver(Solver):
                 pos = pos + vel1 * dt
 
                 # C++ Collider::Enforce(particles): project out and reflect (restitution 1)
-                phi, n = self._func_box_phi_normal(pos)
+                phi, n = self._func_boundary_phi_normal(pos)
                 if phi < 0.0:
                     pos = pos - n * phi
                     vel = self.particles[i_p, i_b].vel
@@ -346,7 +399,7 @@ class FLIPSolver(Solver):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             if self.particles[i_p, i_b].active:
                 pos = self.particles[i_p, i_b].pos
-                phi, n = self._func_box_phi_normal(pos)
+                phi, n = self._func_boundary_phi_normal(pos)
                 if phi < 0.0:
                     pos = pos - n * phi
                     vel = self.particles[i_p, i_b].vel
@@ -396,6 +449,29 @@ class FLIPSolver(Solver):
         for cell in qd.grouped(self.target_fraction):
             # C++: clamp(1 - acc, 1 - 0.74 * (1 + max_ratio=0.1), 1) = clamp(1 - acc, 0.186, 1)
             self.target_fraction[cell] = qd.min(qd.max(1.0 - self.target_fraction[cell], 0.186), 1.0)
+
+    @qd.kernel
+    def _kernel_apply_rotation(self, f: qd.i32, dt: qd.f32):
+        # C++ Advance rotation drive (rotate scene): fluid faces in sand-free cells
+        # (target fraction >= 0.8 on both sides) receive the rigid-body increment omega x r * dt
+        omega = gs.qd_float(self._rotate_omega)
+        max_cell = qd.Vector(self.levelset.shape, dt=gs.qd_int) - 1
+        for idx in qd.grouped(self.vel_u):
+            if self.open_u[idx] == 1.0:
+                i, j, k = idx
+                c0 = self._func_clamp_idx(qd.Vector([i - 1, j, k], dt=gs.qd_int), max_cell)
+                c1 = self._func_clamp_idx(qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
+                if self.target_fraction[c0] >= 0.8 and self.target_fraction[c1] >= 0.8:
+                    pos_y = self._lower_bound[1] + (j + 0.5) * self._dx
+                    self.vel_u[idx] = self.vel_u[idx] - omega * (pos_y - self._center_y) * dt
+        for idx in qd.grouped(self.vel_v):
+            if self.open_v[idx] == 1.0:
+                i, j, k = idx
+                c0 = self._func_clamp_idx(qd.Vector([i, j - 1, k], dt=gs.qd_int), max_cell)
+                c1 = self._func_clamp_idx(qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
+                if self.target_fraction[c0] >= 0.8 and self.target_fraction[c1] >= 0.8:
+                    pos_x = self._lower_bound[0] + (i + 0.5) * self._dx
+                    self.vel_v[idx] = self.vel_v[idx] + omega * (pos_x - self._center_x) * dt
 
     # ---------------------------------- P2G ----------------------------------
 
@@ -462,7 +538,7 @@ class FLIPSolver(Solver):
         max_cell = qd.Vector(self.levelset.shape, dt=gs.qd_int) - 1
         for idx in qd.grouped(self.mark_u):
             i, j, k = idx
-            if i == 0 or i == self.vel_u.shape[0] - 1:
+            if self.open_u[idx] == 0.0:
                 self.mark_u[idx] = 0
             else:
                 c0 = self._func_clamp_idx(qd.Vector([i - 1, j, k], dt=gs.qd_int), max_cell)
@@ -470,7 +546,7 @@ class FLIPSolver(Solver):
                 self.mark_u[idx] = 1 if (self.levelset[c0] <= 0.0 or self.levelset[c1] <= 0.0) else 0
         for idx in qd.grouped(self.mark_v):
             i, j, k = idx
-            if j == 0 or j == self.vel_v.shape[1] - 1:
+            if self.open_v[idx] == 0.0:
                 self.mark_v[idx] = 0
             else:
                 c0 = self._func_clamp_idx(qd.Vector([i, j - 1, k], dt=gs.qd_int), max_cell)
@@ -478,7 +554,7 @@ class FLIPSolver(Solver):
                 self.mark_v[idx] = 1 if (self.levelset[c0] <= 0.0 or self.levelset[c1] <= 0.0) else 0
         for idx in qd.grouped(self.mark_w):
             i, j, k = idx
-            if k == 0 or k == self.vel_w.shape[2] - 1:
+            if self.open_w[idx] == 0.0:
                 self.mark_w[idx] = 0
             else:
                 c0 = self._func_clamp_idx(qd.Vector([i, j, k - 1], dt=gs.qd_int), max_cell)
@@ -487,10 +563,11 @@ class FLIPSolver(Solver):
 
     @qd.kernel
     def _kernel_extrapolate_sweep(self, f: qd.i32):
-        # one Jacobi fill sweep per axis: unmarked faces take the average of their marked neighbors
+        # one Jacobi fill sweep per axis: unmarked OPEN faces take the average of their marked neighbors
+        # (closed faces are excluded as targets; they stay zero, keeping vdiff clean near walls)
         for idx in qd.grouped(self.vel_u):
             self.scratch_u[idx] = 0.0
-            if self.mark_u[idx] == 0:
+            if self.mark_u[idx] == 0 and self.open_u[idx] == 1.0:
                 total = gs.qd_float(0.0)
                 count = 0
                 for d in qd.static(range(3)):
@@ -508,7 +585,7 @@ class FLIPSolver(Solver):
                 self.mark_u[idx] = 1
         for idx in qd.grouped(self.vel_v):
             self.scratch_v[idx] = 0.0
-            if self.mark_v[idx] == 0:
+            if self.mark_v[idx] == 0 and self.open_v[idx] == 1.0:
                 total = gs.qd_float(0.0)
                 count = 0
                 for d in qd.static(range(3)):
@@ -526,7 +603,7 @@ class FLIPSolver(Solver):
                 self.mark_v[idx] = 1
         for idx in qd.grouped(self.vel_w):
             self.scratch_w[idx] = 0.0
-            if self.mark_w[idx] == 0:
+            if self.mark_w[idx] == 0 and self.open_w[idx] == 1.0:
                 total = gs.qd_float(0.0)
                 count = 0
                 for d in qd.static(range(3)):
@@ -561,15 +638,16 @@ class FLIPSolver(Solver):
 
     @qd.kernel
     def _kernel_enforce_velocity_boundary(self, f: qd.i32):
-        # C++ Collider::Enforce(velocity): fully solid (domain boundary) faces take the wall velocity 0
+        # C++ Collider::Enforce(velocity): fully solid faces (box boundary or outside the cylinder) take
+        # the wall velocity 0
         for idx in qd.grouped(self.vel_u):
-            if idx[0] == 0 or idx[0] == self.vel_u.shape[0] - 1:
+            if self.open_u[idx] == 0.0:
                 self.vel_u[idx] = 0.0
         for idx in qd.grouped(self.vel_v):
-            if idx[1] == 0 or idx[1] == self.vel_v.shape[1] - 1:
+            if self.open_v[idx] == 0.0:
                 self.vel_v[idx] = 0.0
         for idx in qd.grouped(self.vel_w):
-            if idx[2] == 0 or idx[2] == self.vel_w.shape[2] - 1:
+            if self.open_w[idx] == 0.0:
                 self.vel_w[idx] = 0.0
 
     # ------------------------------ pressure solve ------------------------------
@@ -593,22 +671,33 @@ class FLIPSolver(Solver):
                     for s in qd.static((-1, 1)):
                         nb = cell + qd.Vector.unit(3, d, gs.qd_int) * s
                         if self._func_in_bounds(nb, max_cell):
-                            coef = 0.5 * (f_r + self.target_fraction[nb])
-                            face_vel = gs.qd_float(0.0)
+                            face = nb if s > 0 else cell
+                            w_open = gs.qd_float(0.0)
                             if d == 0:
-                                face_vel = self.vel_u[nb if s > 0 else cell]
+                                w_open = self.open_u[face]
                             elif d == 1:
-                                face_vel = self.vel_v[nb if s > 0 else cell]
+                                w_open = self.open_v[face]
                             else:
-                                face_vel = self.vel_w[nb if s > 0 else cell]
-                            rhs -= s * face_vel * coef
-                            if self.grid2mat[nb] >= 0:
-                                diag += coef
-                            else:
-                                theta = self.levelset[cell] / (self.levelset[cell] - self.levelset[nb])
-                                diag += coef / max(theta, 0.001)
+                                w_open = self.open_w[face]
+                            if w_open > 0.0:
+                                coef = 0.5 * (f_r + self.target_fraction[nb])
+                                face_vel = gs.qd_float(0.0)
+                                if d == 0:
+                                    face_vel = self.vel_u[face]
+                                elif d == 1:
+                                    face_vel = self.vel_v[face]
+                                else:
+                                    face_vel = self.vel_w[face]
+                                rhs -= s * face_vel * coef
+                                if self.grid2mat[nb] >= 0:
+                                    diag += coef
+                                else:
+                                    theta = self.levelset[cell] / (self.levelset[cell] - self.levelset[nb])
+                                    diag += coef / max(theta, 0.001)
                 self.p_rhs[cell] = rhs
-                self.p_diag[cell] = max(diag, 1e-12)
+                # C++ falls back to an identity row when the diagonal vanishes (isolated fluid cell);
+                # a near-zero diagonal would blow up the Jacobi preconditioner
+                self.p_diag[cell] = diag if diag > 1e-8 else 1.0
 
     @qd.kernel
     def _kernel_projection_matvec(self, f: qd.i32):
@@ -622,8 +711,17 @@ class FLIPSolver(Solver):
                     for s in qd.static((-1, 1)):
                         nb = cell + qd.Vector.unit(3, d, gs.qd_int) * s
                         if self._func_in_bounds(nb, max_cell):
-                            if self.grid2mat[nb] >= 0:
-                                acc -= self.p_d[nb] * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
+                            face = nb if s > 0 else cell
+                            w_open = gs.qd_float(0.0)
+                            if d == 0:
+                                w_open = self.open_u[face]
+                            elif d == 1:
+                                w_open = self.open_v[face]
+                            else:
+                                w_open = self.open_w[face]
+                            if w_open > 0.0:
+                                if self.grid2mat[nb] >= 0:
+                                    acc -= self.p_d[nb] * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
                 self.p_ap[cell] = self.p_diag[cell] * self.p_d[cell] + acc
 
     @qd.kernel
@@ -632,7 +730,7 @@ class FLIPSolver(Solver):
         # use the theta condition with p = 0 in air
         for idx in qd.grouped(self.vel_u):
             i, j, k = idx
-            if i == 0 or i == self.vel_u.shape[0] - 1:
+            if self.open_u[idx] == 0.0:
                 continue
             c0 = qd.Vector([i - 1, j, k], dt=gs.qd_int)
             c1 = qd.Vector([i, j, k], dt=gs.qd_int)
@@ -651,7 +749,7 @@ class FLIPSolver(Solver):
                 self.vel_u[idx] = self.vel_u[idx] + (1.0 if id0 >= 0 else -1.0) * p_inner * intf
         for idx in qd.grouped(self.vel_v):
             i, j, k = idx
-            if j == 0 or j == self.vel_v.shape[1] - 1:
+            if self.open_v[idx] == 0.0:
                 continue
             c0 = qd.Vector([i, j - 1, k], dt=gs.qd_int)
             c1 = qd.Vector([i, j, k], dt=gs.qd_int)
@@ -670,7 +768,7 @@ class FLIPSolver(Solver):
                 self.vel_v[idx] = self.vel_v[idx] + (1.0 if id0 >= 0 else -1.0) * p_inner * intf
         for idx in qd.grouped(self.vel_w):
             i, j, k = idx
-            if k == 0 or k == self.vel_w.shape[2] - 1:
+            if self.open_w[idx] == 0.0:
                 continue
             c0 = qd.Vector([i, j, k - 1], dt=gs.qd_int)
             c1 = qd.Vector([i, j, k], dt=gs.qd_int)
@@ -700,11 +798,11 @@ class FLIPSolver(Solver):
     @qd.kernel
     def _kernel_update_veldiff(self, f: qd.i32):
         for idx in qd.grouped(self.vel_u):
-            self.vdiff_u[idx] = self.vel_u[idx] - self.vdiff_u[idx]
+            self.vdiff_u[idx] = (self.vel_u[idx] - self.vdiff_u[idx]) * self.open_u[idx]
         for idx in qd.grouped(self.vel_v):
-            self.vdiff_v[idx] = self.vel_v[idx] - self.vdiff_v[idx]
+            self.vdiff_v[idx] = (self.vel_v[idx] - self.vdiff_v[idx]) * self.open_v[idx]
         for idx in qd.grouped(self.vel_w):
-            self.vdiff_w[idx] = self.vel_w[idx] - self.vdiff_w[idx]
+            self.vdiff_w[idx] = (self.vel_w[idx] - self.vdiff_w[idx]) * self.open_w[idx]
 
     @qd.kernel
     def _kernel_max_face_vel(self, max_vel: qd.types.ndarray()):
@@ -743,10 +841,19 @@ class FLIPSolver(Solver):
                     for s in qd.static((-1, 1)):
                         nb = cell + qd.Vector.unit(3, d, gs.qd_int) * s
                         if self._func_in_bounds(nb, max_cell):
-                            diag += 0.5 * (f_r + self.target_fraction[nb])
-                            if self.grid2mat[nb] < 0:
-                                is_boundary = True
-                self.p_diag[cell] = max(diag, 1e-12)
+                            face = nb if s > 0 else cell
+                            w_open = gs.qd_float(0.0)
+                            if d == 0:
+                                w_open = self.open_u[face]
+                            elif d == 1:
+                                w_open = self.open_v[face]
+                            else:
+                                w_open = self.open_w[face]
+                            if w_open > 0.0:
+                                diag += 0.5 * (f_r + self.target_fraction[nb])
+                                if self.grid2mat[nb] < 0:
+                                    is_boundary = True
+                self.p_diag[cell] = diag if diag > 1e-8 else 1.0
                 if not is_boundary:
                     # C++ rhs 1 - clamp(density / f_r, .5, 1.5), times f_r (symmetrized system)
                     self.p_rhs[cell] = f_r - qd.min(qd.max(self.density[cell], 0.5 * f_r), 1.5 * f_r)
@@ -762,8 +869,17 @@ class FLIPSolver(Solver):
                     for s in qd.static((-1, 1)):
                         nb = cell + qd.Vector.unit(3, d, gs.qd_int) * s
                         if self._func_in_bounds(nb, max_cell):
-                            if self.grid2mat[nb] >= 0:
-                                acc -= self.p_d[nb] * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
+                            face = nb if s > 0 else cell
+                            w_open = gs.qd_float(0.0)
+                            if d == 0:
+                                w_open = self.open_u[face]
+                            elif d == 1:
+                                w_open = self.open_v[face]
+                            else:
+                                w_open = self.open_w[face]
+                            if w_open > 0.0:
+                                if self.grid2mat[nb] >= 0:
+                                    acc -= self.p_d[nb] * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
                 self.p_ap[cell] = self.p_diag[cell] * self.p_d[cell] + acc
 
     @qd.kernel
@@ -1029,6 +1145,10 @@ class FLIPSolver(Solver):
         for _ in range(3):
             self._kernel_extrapolate_sweep(f)
         self._kernel_save_velocity(f)
+
+        # rotation drive (C++ Advance: after P2G, before body forces, while t < rotate_duration)
+        if self._rotate_omega != 0.0 and self._sim.cur_t < self._rotate_duration:
+            self._kernel_apply_rotation(f, dt)
 
         # 4. body forces, then zero the boundary faces: the reference divergence uses the wall
         # velocity (0) on solid faces, so gravity must not leak into the rhs through them

@@ -63,6 +63,12 @@ class DEMSolver(Solver):
         self._m_ddt = None
         self._ddt_safety = options.ddt_safety
 
+        # optional hollow-cylinder collider (axis along z through the domain center), C++ rotate scene
+        self._cylinder_radius = options.cylinder_radius
+        self._has_cylinder = options.cylinder_radius is not None
+        self._center_x = 0.5 * float(self._lower_bound[0] + self._upper_bound[0])
+        self._center_y = 0.5 * float(self._lower_bound[1] + self._upper_bound[1])
+
     def build(self):
         super().build()
 
@@ -395,6 +401,17 @@ class DEMSolver(Solver):
                         phi = self._upper_bound[i_a] - pos[i_a]
                         n = qd.Vector.zero(gs.qd_float, 3)
                         n[i_a] = -1.0
+                if qd.static(self._has_cylinder):
+                    dx_ = pos[0] - self._center_x
+                    dy_ = pos[1] - self._center_y
+                    rho = qd.sqrt(dx_ * dx_ + dy_ * dy_)
+                    phi_c = self._cylinder_radius - rho
+                    if phi_c < phi:
+                        phi = phi_c
+                        n = qd.Vector.zero(gs.qd_float, 3)
+                        if rho > gs.EPS:
+                            n[0] = -dx_ / rho
+                            n[1] = -dy_ / rho
 
                 if phi < 0.5 * particle_radius:
                     if phi < 0.0:
