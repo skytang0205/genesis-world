@@ -106,6 +106,11 @@ class FLIPSolver(Solver):
                     f"(V_dem={dem._particle_volume:.3e}, dx={self._dx:.4f}). Increase grid_res or particle_size."
                 )
             self._single_ratio = 1.0 / n_absorbable
+        # C++ DEMParticle::max_ratio (0.1 by default); fraction lower bound 1 - 0.74 * (1 + max_ratio)
+        self._max_ratio = (
+            float(self._sim.dem_solver._entities[0].material.max_ratio) if self._dem_coupling else 0.1
+        )
+        self._fraction_floor = 1.0 - 0.74 * (1.0 + self._max_ratio)
 
         # FIXME: _gravity must be a raw qd.field() -- see comment in mpm_solver.py
         if self._gravity is not None:
@@ -488,8 +493,8 @@ class FLIPSolver(Solver):
                     cell = self._func_clamp_idx(base + qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
                     qd.atomic_add(self.target_fraction[cell], w * pfrac)
         for cell in qd.grouped(self.target_fraction):
-            # C++: clamp(1 - acc, 1 - 0.74 * (1 + max_ratio=0.1), 1) = clamp(1 - acc, 0.186, 1)
-            self.target_fraction[cell] = qd.min(qd.max(1.0 - self.target_fraction[cell], 0.186), 1.0)
+            # C++: clamp(1 - acc, 1 - 0.74 * (1 + max_ratio), 1)
+            self.target_fraction[cell] = qd.min(qd.max(1.0 - self.target_fraction[cell], self._fraction_floor), 1.0)
 
     @qd.kernel
     def _kernel_apply_rotation(self, f: qd.i32, dt: qd.f32):
@@ -1008,7 +1013,7 @@ class FLIPSolver(Solver):
         max_cell = qd.Vector(self.needed_ratio.shape, dt=gs.qd_int) - 1
         for i_p, i_b in qd.ndrange(dem._n_particles, self._B):
             if dem.particles[i_p, i_b].active:
-                need = 0.1 - dem.particles[i_p, i_b].ratio
+                need = self._max_ratio - dem.particles[i_p, i_b].ratio
                 base, frac = self._func_trilerp_weights(
                     dem.particles[i_p, i_b].pos, qd.Vector([0.5, 0.5, 0.5])
                 )
@@ -1063,7 +1068,7 @@ class FLIPSolver(Solver):
                         frac[2] if k else 1.0 - frac[2]
                     )
                     cell = self._func_clamp_idx(base + qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
-                    ar = (0.1 - ratio) * self.absorb_ratio[cell] / qd.max(self.needed_ratio[cell], 1e-12)
+                    ar = (self._max_ratio - ratio) * self.absorb_ratio[cell] / qd.max(self.needed_ratio[cell], 1e-12)
                     add_ratio += w * ar
                     add_vel += self.absorb_vel[cell] * (w * ar)
                 if add_ratio > 0.0:

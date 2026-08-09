@@ -32,6 +32,9 @@ class Sand(Base["DEMEntity"]):
     friction_angle : float, optional
         Friction angle in radians. Tangential contact forces are clamped by the Coulomb limit
         `|f_shear| <= |f_normal| * tan(friction_angle)`. Defaults to 0.5, matching the reference implementation.
+    max_ratio : float, optional
+        Maximum water-mass fraction a grain can absorb (reference value 0.1). Larger values absorb more
+        water per grain and faster (more absorption events per cell per water step). Defaults to 0.1.
     sampler : str, optional
         Initial particle placement, matching the two modes of the reference volume sampler: 'fcc' places grains on
         a face-centered cubic lattice, 'poisson' uses Poisson-disk sampling. Both enforce a nearest-neighbor
@@ -46,5 +49,6 @@ class Sand(Base["DEMEntity"]):
     young_modulus: PositiveFloat = 1e6
     poisson_ratio: PositiveFloat = 0.3
     friction_angle: PositiveFloat = 0.5
+    max_ratio: PositiveFloat = 0.1
     sampler: SamplerType = DEFAULT_SAMPLER
     sampler_seed: NonNegativeInt = 42
