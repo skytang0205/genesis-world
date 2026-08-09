@@ -147,6 +147,12 @@ class DEMSolver(Solver):
         self.obstacle_half = qd.field(gs.qd_vec3, shape=(self._B,))
         self.obstacle_enabled = qd.field(gs.qd_int, shape=(self._B,))
 
+        # optional moving sieve (grid of bars) obstacle; see set_sieve_obstacle
+        self.sieve_pos = qd.field(gs.qd_vec3, shape=(self._B,))
+        self.sieve_vel = qd.field(gs.qd_vec3, shape=(self._B,))
+        self.sieve_params = qd.field(gs.qd_vec4, shape=(self._B,))  # half_extent, bar_width, bar_period, thickness
+        self.sieve_enabled = qd.field(gs.qd_int, shape=(self._B,))
+
     @property
     def is_active(self):
         return self.n_particles > 0
@@ -206,6 +212,52 @@ class DEMSolver(Solver):
         Current center position of the moving box obstacle (per env, shape (n_envs, 3)).
         """
         return self.obstacle_pos.to_numpy()
+
+    @gs.assert_built
+    def set_sieve_obstacle(self, half_extent, bar_width, bar_period, thickness, pos, vel=(0.0, 0.0, 0.0)):
+        """
+        Place a square mesh sieve (two perpendicular families of parallel bars) and enable it.
+
+        The sieve plane is horizontal (xy) and moves like the box obstacle: its position advances
+        internally by vel * ddt at every DEM sub-substep.
+
+        Parameters
+        ----------
+        half_extent : float
+            Half side length of the square sieve in meters.
+        bar_width : float
+            Bar width in meters.
+        bar_period : float
+            Bar center-to-center period in meters (opening = period - bar_width).
+        thickness : float
+            Bar thickness (z) in meters.
+        pos : tuple, shape (3,)
+            Center of the sieve plane in meters.
+        vel : tuple, shape (3,), optional
+            Velocity of the sieve in m/s. Defaults to zero.
+        """
+        self.sieve_params.from_numpy(
+            np.tile(
+                np.array([half_extent, bar_width, bar_period, thickness], dtype=gs.np_float), (self._B, 1)
+            )
+        )
+        self.sieve_enabled.from_numpy(np.ones((self._B,), dtype=gs.np_int))
+        self.sieve_pos.from_numpy(np.tile(np.asarray(pos, dtype=gs.np_float), (self._B, 1)))
+        self.sieve_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
+
+    @gs.assert_built
+    def set_sieve_vel(self, vel):
+        """
+        Set the sieve velocity. Its position advances internally every DEM sub-substep.
+        """
+        self.sieve_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
+
+    @gs.assert_built
+    def get_sieve_pos(self):
+        """
+        Current center position of the sieve (per env, shape (n_envs, 3)).
+        """
+        return self.sieve_pos.to_numpy()
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------- kernels --------------------------------------
@@ -379,6 +431,43 @@ class DEMSolver(Solver):
                 reordered_idx = self.particles_ng[i_p, i_b].reordered_idx
                 self.particles[i_p, i_b].acc = self.particles_reordered[reordered_idx, i_b].acc
 
+    @qd.func
+    def _func_sieve_sdf(self, pos, i_b: qd.i32):
+        # signed distance to the sieve solid (negative inside a bar): union of two perpendicular
+        # families of bars, each a periodic box family clipped to the square extent
+        rel = pos - self.sieve_pos[i_b]
+        half = self.sieve_params[i_b][0]
+        bw = self.sieve_params[i_b][1]
+        period = self.sieve_params[i_b][2]
+        thick = self.sieve_params[i_b][3]
+        sdf = gs.qd_float(1e30)
+        for fam in qd.static(range(2)):
+            # distance to the nearest bar centerline along the family's cross direction
+            u = rel[fam]
+            v = rel[1 - fam]
+            d_bar = abs(u - period * qd.floor(u / period + 0.5)) - 0.5 * bw
+            d_fam = qd.max(
+                qd.max(d_bar, abs(rel[2]) - 0.5 * thick),
+                qd.max(abs(u) - half, abs(v) - half),
+            )
+            sdf = qd.min(sdf, d_fam)
+        return sdf
+
+    @qd.func
+    def _func_sieve_normal(self, pos, i_b: qd.i32):
+        # inward normal of the sieve SDF by central differences (bar edges are non-smooth, as with
+        # the reference's level-set gradient normals)
+        eps = gs.qd_float(1e-5)
+        n = qd.Vector.zero(gs.qd_float, 3)
+        for a in qd.static(range(3)):
+            dp = qd.Vector.zero(gs.qd_float, 3)
+            dp[a] = eps
+            n[a] = self._func_sieve_sdf(pos + dp, i_b) - self._func_sieve_sdf(pos - dp, i_b)
+        norm = n.norm()
+        if norm > gs.EPS:
+            n = n / norm
+        return n
+
     @qd.kernel
     def _kernel_enforce_boundary(self, f: qd.i32, particle_radius: qd.f32, tan_fric: qd.f32):
         # C++ Collider::Enforce(DEMParticles, ddt, radius): domain box (static, phi positive inside) plus an
@@ -462,6 +551,24 @@ class DEMSolver(Solver):
                             if vt_norm > gs.EPS:
                                 acc = acc + acc_n * tan_fric * dv_tangential / vt_norm
 
+                # moving sieve obstacle (same enforcement semantics)
+                if self.sieve_enabled[i_b] == 1:
+                    phi_s = self._func_sieve_sdf(pos, i_b)
+                    if phi_s < 0.5 * particle_radius:
+                        n_s = self._func_sieve_normal(pos, i_b)
+                        delta_vel = vel - self.sieve_vel[i_b]
+                        if phi_s < 0.0:
+                            pos = pos - n_s * phi_s
+                            dv_n = delta_vel.dot(n_s)
+                            if dv_n < 0.0:
+                                vel = vel - 1.5 * dv_n * n_s
+                        acc_n = acc.dot(n_s)
+                        if acc_n < 0.0:
+                            dv_tangential = delta_vel - delta_vel.dot(n_s) * n_s
+                            vt_norm = dv_tangential.norm()
+                            if vt_norm > gs.EPS:
+                                acc = acc + acc_n * tan_fric * dv_tangential / vt_norm
+
                 self.particles[i_p, i_b].pos = pos
                 self.particles[i_p, i_b].vel = vel
                 self.particles[i_p, i_b].acc = acc
@@ -472,6 +579,8 @@ class DEMSolver(Solver):
         for i_b in range(self._B):
             if self.obstacle_enabled[i_b] == 1:
                 self.obstacle_pos[i_b] = self.obstacle_pos[i_b] + self.obstacle_vel[i_b] * ddt
+            if self.sieve_enabled[i_b] == 1:
+                self.sieve_pos[i_b] = self.sieve_pos[i_b] + self.sieve_vel[i_b] * ddt
 
     @qd.kernel
     def _kernel_integrate(self, f: qd.i32, ddt: qd.f32):
