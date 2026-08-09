@@ -214,29 +214,70 @@ class FLIPSolver(Solver):
         self._entities.append(entity)
         return entity
 
+    @staticmethod
+    def _corner_fraction(phi0, phi1, phi2):
+        # C++ Collider::CalcFaceFraction's corner subdivision: solid fraction of the triangle
+        # (phi <= 0 is solid). theta(p, q) = p / (p - q)
+        p = np.sort(np.stack([phi0, phi1, phi2], axis=0), axis=0)
+        a, b, c = p[0], p[1], p[2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_ca = np.nan_to_num(c / (c - a), nan=1.0, posinf=1.0)
+            t_cb = np.nan_to_num(c / (c - b), nan=1.0, posinf=1.0)
+            t_ab = np.nan_to_num(a / (a - b), nan=0.0)
+            t_ac = np.nan_to_num(a / (a - c), nan=0.0)
+        frac = np.where(
+            c <= 0,
+            1.0,
+            np.where(b <= 0, 1.0 - t_ca * t_cb, np.where(a <= 0, t_ab * t_ac, 0.0)),
+        )
+        return frac
+
     def _build_open_masks(self):
-        # open == 1 on faces strictly inside the domain box and (if enabled) the cylinder; 0 on solid faces
+        # per-face open weight in [0, 1]: 0 on fully solid faces (box boundary / outside the cylinder),
+        # fractional on faces cut by the cylinder surface (C++ Collider::CalcFaceFraction)
         R = self._cylinder_radius
         lo = self._lower_bound
-        for axis, (field, shape) in enumerate(
-            [(self.open_u, self.open_u.shape), (self.open_v, self.open_v.shape), (self.open_w, self.open_w.shape)]
-        ):
+        hi = self._upper_bound
+        for axis, field in enumerate([self.open_u, self.open_v, self.open_w]):
+            shape = field.shape
             offsets = np.array([0.5, 0.5, 0.5])
             offsets[axis] = 0.0
-            grids = np.meshgrid(
-                *(np.arange(n) for n in shape), indexing="ij"
-            )
+            grids = np.meshgrid(*(np.arange(n) for n in shape), indexing="ij")
             pos = lo[None, None, None, :] + (np.stack(grids, axis=-1) + offsets) * self._dx
-            open_mask = np.ones(shape, dtype=gs.np_float)
-            # box boundary faces are solid
-            on_box = np.zeros(shape, dtype=bool)
-            on_box |= np.isclose(pos[..., axis], lo[axis])
-            on_box |= np.isclose(pos[..., axis], self._upper_bound[axis])
+            open_mask = np.ones(shape, dtype=np.float64)
+            # box boundary faces are fully solid
+            on_box = np.isclose(pos[..., axis], lo[axis]) | np.isclose(pos[..., axis], hi[axis])
             open_mask[on_box] = 0.0
             if R is not None:
-                rr2 = (pos[..., 0] - self._center_x) ** 2 + (pos[..., 1] - self._center_y) ** 2
-                open_mask[rr2 > R * R] = 0.0
-            field.from_numpy(np.ascontiguousarray(open_mask))
+                # node SDF of the cylinder (positive = free): nodes sit at lower + idx * dx
+                node_shape = tuple(n + 1 for n in shape)
+                ngrids = np.meshgrid(*(np.arange(n) for n in node_shape), indexing="ij")
+                npos = lo[None, None, None, :] + np.stack(ngrids, axis=-1) * self._dx
+                phi = R - np.hypot(npos[..., 0] - self._center_x, npos[..., 1] - self._center_y)
+                # the 4 corner nodes of a face: c00, c01, c11, c10 along the two non-axis directions
+                s0 = [slice(None)] * 3
+                s1 = [slice(None)] * 3
+                axes2 = [a for a in range(3) if a != axis]
+                def corner(o1, o2):
+                    sl = [slice(None)] * 3
+                    sl[axes2[0]] = slice(o1, o1 + shape[axes2[0]])
+                    sl[axes2[1]] = slice(o2, o2 + shape[axes2[1]])
+                    sl[axis] = slice(0, shape[axis])
+                    return phi[tuple(sl)]
+                c00 = corner(0, 0)
+                c01 = corner(0, 1)
+                c11 = corner(1, 1)
+                c10 = corner(1, 0)
+                center = (c00 + c01 + c11 + c10) * 0.25
+                frac = (
+                    self._corner_fraction(center, c00, c01)
+                    + self._corner_fraction(center, c01, c11)
+                    + self._corner_fraction(center, c11, c10)
+                    + self._corner_fraction(center, c10, c00)
+                ) * 0.25
+                frac = np.where(frac > 0.9, 1.0, frac)
+                open_mask = np.minimum(open_mask, 1.0 - frac)
+            field.from_numpy(np.ascontiguousarray(open_mask.astype(gs.np_float)))
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- grid helpers -------------------------------------
@@ -457,7 +498,7 @@ class FLIPSolver(Solver):
         omega = gs.qd_float(self._rotate_omega)
         max_cell = qd.Vector(self.levelset.shape, dt=gs.qd_int) - 1
         for idx in qd.grouped(self.vel_u):
-            if self.open_u[idx] == 1.0:
+            if self.open_u[idx] > 0.0:
                 i, j, k = idx
                 c0 = self._func_clamp_idx(qd.Vector([i - 1, j, k], dt=gs.qd_int), max_cell)
                 c1 = self._func_clamp_idx(qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
@@ -465,7 +506,7 @@ class FLIPSolver(Solver):
                     pos_y = self._lower_bound[1] + (j + 0.5) * self._dx
                     self.vel_u[idx] = self.vel_u[idx] - omega * (pos_y - self._center_y) * dt
         for idx in qd.grouped(self.vel_v):
-            if self.open_v[idx] == 1.0:
+            if self.open_v[idx] > 0.0:
                 i, j, k = idx
                 c0 = self._func_clamp_idx(qd.Vector([i, j - 1, k], dt=gs.qd_int), max_cell)
                 c1 = self._func_clamp_idx(qd.Vector([i, j, k], dt=gs.qd_int), max_cell)
@@ -567,7 +608,7 @@ class FLIPSolver(Solver):
         # (closed faces are excluded as targets; they stay zero, keeping vdiff clean near walls)
         for idx in qd.grouped(self.vel_u):
             self.scratch_u[idx] = 0.0
-            if self.mark_u[idx] == 0 and self.open_u[idx] == 1.0:
+            if self.mark_u[idx] == 0 and self.open_u[idx] > 0.0:
                 total = gs.qd_float(0.0)
                 count = 0
                 for d in qd.static(range(3)):
@@ -585,7 +626,7 @@ class FLIPSolver(Solver):
                 self.mark_u[idx] = 1
         for idx in qd.grouped(self.vel_v):
             self.scratch_v[idx] = 0.0
-            if self.mark_v[idx] == 0 and self.open_v[idx] == 1.0:
+            if self.mark_v[idx] == 0 and self.open_v[idx] > 0.0:
                 total = gs.qd_float(0.0)
                 count = 0
                 for d in qd.static(range(3)):
@@ -603,7 +644,7 @@ class FLIPSolver(Solver):
                 self.mark_v[idx] = 1
         for idx in qd.grouped(self.vel_w):
             self.scratch_w[idx] = 0.0
-            if self.mark_w[idx] == 0 and self.open_w[idx] == 1.0:
+            if self.mark_w[idx] == 0 and self.open_w[idx] > 0.0:
                 total = gs.qd_float(0.0)
                 count = 0
                 for d in qd.static(range(3)):
@@ -680,7 +721,7 @@ class FLIPSolver(Solver):
                             else:
                                 w_open = self.open_w[face]
                             if w_open > 0.0:
-                                coef = 0.5 * (f_r + self.target_fraction[nb])
+                                coef = w_open * 0.5 * (f_r + self.target_fraction[nb])
                                 face_vel = gs.qd_float(0.0)
                                 if d == 0:
                                     face_vel = self.vel_u[face]
@@ -721,7 +762,7 @@ class FLIPSolver(Solver):
                                 w_open = self.open_w[face]
                             if w_open > 0.0:
                                 if self.grid2mat[nb] >= 0:
-                                    acc -= self.p_d[nb] * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
+                                    acc -= self.p_d[nb] * w_open * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
                 self.p_ap[cell] = self.p_diag[cell] * self.p_d[cell] + acc
 
     @qd.kernel
@@ -737,16 +778,17 @@ class FLIPSolver(Solver):
             id0 = self.grid2mat[c0]
             id1 = self.grid2mat[c1]
             if id0 >= 0 and id1 >= 0:
-                # C++ ApplyProjection also stores the gradient (m_GradPressure1); weight == 1 inside the box domain
-                self.vel_u[idx] = self.vel_u[idx] - (self.p_x[c1] - self.p_x[c0])
-                self.grad_p_u[idx] = self.p_x[c1] - self.p_x[c0]
+                # C++ ApplyProjection also stores the gradient (m_GradPressure1); both scale with the open weight
+                w_f = self.open_u[idx]
+                self.vel_u[idx] = self.vel_u[idx] - (self.p_x[c1] - self.p_x[c0]) * w_f
+                self.grad_p_u[idx] = (self.p_x[c1] - self.p_x[c0]) * w_f
             elif id0 >= 0 or id1 >= 0:
                 phi0 = self.levelset[c0]
                 phi1 = self.levelset[c1]
                 theta = phi0 / (phi0 - phi1)
                 p_inner = self.p_x[c0] if id0 >= 0 else self.p_x[c1]
                 intf = 1.0 / max(theta if id0 >= 0 else 1.0 - theta, 0.001)
-                self.vel_u[idx] = self.vel_u[idx] + (1.0 if id0 >= 0 else -1.0) * p_inner * intf
+                self.vel_u[idx] = self.vel_u[idx] + (1.0 if id0 >= 0 else -1.0) * p_inner * intf * self.open_u[idx]
         for idx in qd.grouped(self.vel_v):
             i, j, k = idx
             if self.open_v[idx] == 0.0:
@@ -756,16 +798,17 @@ class FLIPSolver(Solver):
             id0 = self.grid2mat[c0]
             id1 = self.grid2mat[c1]
             if id0 >= 0 and id1 >= 0:
-                # C++ ApplyProjection also stores the gradient (m_GradPressure1); weight == 1 inside the box domain
-                self.vel_v[idx] = self.vel_v[idx] - (self.p_x[c1] - self.p_x[c0])
-                self.grad_p_v[idx] = self.p_x[c1] - self.p_x[c0]
+                # C++ ApplyProjection also stores the gradient (m_GradPressure1); both scale with the open weight
+                w_f = self.open_v[idx]
+                self.vel_v[idx] = self.vel_v[idx] - (self.p_x[c1] - self.p_x[c0]) * w_f
+                self.grad_p_v[idx] = (self.p_x[c1] - self.p_x[c0]) * w_f
             elif id0 >= 0 or id1 >= 0:
                 phi0 = self.levelset[c0]
                 phi1 = self.levelset[c1]
                 theta = phi0 / (phi0 - phi1)
                 p_inner = self.p_x[c0] if id0 >= 0 else self.p_x[c1]
                 intf = 1.0 / max(theta if id0 >= 0 else 1.0 - theta, 0.001)
-                self.vel_v[idx] = self.vel_v[idx] + (1.0 if id0 >= 0 else -1.0) * p_inner * intf
+                self.vel_v[idx] = self.vel_v[idx] + (1.0 if id0 >= 0 else -1.0) * p_inner * intf * self.open_v[idx]
         for idx in qd.grouped(self.vel_w):
             i, j, k = idx
             if self.open_w[idx] == 0.0:
@@ -775,16 +818,17 @@ class FLIPSolver(Solver):
             id0 = self.grid2mat[c0]
             id1 = self.grid2mat[c1]
             if id0 >= 0 and id1 >= 0:
-                # C++ ApplyProjection also stores the gradient (m_GradPressure1); weight == 1 inside the box domain
-                self.vel_w[idx] = self.vel_w[idx] - (self.p_x[c1] - self.p_x[c0])
-                self.grad_p_w[idx] = self.p_x[c1] - self.p_x[c0]
+                # C++ ApplyProjection also stores the gradient (m_GradPressure1); both scale with the open weight
+                w_f = self.open_w[idx]
+                self.vel_w[idx] = self.vel_w[idx] - (self.p_x[c1] - self.p_x[c0]) * w_f
+                self.grad_p_w[idx] = (self.p_x[c1] - self.p_x[c0]) * w_f
             elif id0 >= 0 or id1 >= 0:
                 phi0 = self.levelset[c0]
                 phi1 = self.levelset[c1]
                 theta = phi0 / (phi0 - phi1)
                 p_inner = self.p_x[c0] if id0 >= 0 else self.p_x[c1]
                 intf = 1.0 / max(theta if id0 >= 0 else 1.0 - theta, 0.001)
-                self.vel_w[idx] = self.vel_w[idx] + (1.0 if id0 >= 0 else -1.0) * p_inner * intf
+                self.vel_w[idx] = self.vel_w[idx] + (1.0 if id0 >= 0 else -1.0) * p_inner * intf * self.open_w[idx]
 
     @qd.kernel
     def _kernel_save_velocity(self, f: qd.i32):
@@ -798,11 +842,11 @@ class FLIPSolver(Solver):
     @qd.kernel
     def _kernel_update_veldiff(self, f: qd.i32):
         for idx in qd.grouped(self.vel_u):
-            self.vdiff_u[idx] = (self.vel_u[idx] - self.vdiff_u[idx]) * self.open_u[idx]
+            self.vdiff_u[idx] = (self.vel_u[idx] - self.vdiff_u[idx]) if self.open_u[idx] > 0.0 else 0.0
         for idx in qd.grouped(self.vel_v):
-            self.vdiff_v[idx] = (self.vel_v[idx] - self.vdiff_v[idx]) * self.open_v[idx]
+            self.vdiff_v[idx] = (self.vel_v[idx] - self.vdiff_v[idx]) if self.open_v[idx] > 0.0 else 0.0
         for idx in qd.grouped(self.vel_w):
-            self.vdiff_w[idx] = (self.vel_w[idx] - self.vdiff_w[idx]) * self.open_w[idx]
+            self.vdiff_w[idx] = (self.vel_w[idx] - self.vdiff_w[idx]) if self.open_w[idx] > 0.0 else 0.0
 
     @qd.kernel
     def _kernel_max_face_vel(self, max_vel: qd.types.ndarray()):
@@ -850,7 +894,7 @@ class FLIPSolver(Solver):
                             else:
                                 w_open = self.open_w[face]
                             if w_open > 0.0:
-                                diag += 0.5 * (f_r + self.target_fraction[nb])
+                                diag += w_open * 0.5 * (f_r + self.target_fraction[nb])
                                 if self.grid2mat[nb] < 0:
                                     is_boundary = True
                 self.p_diag[cell] = diag if diag > 1e-8 else 1.0
@@ -879,7 +923,7 @@ class FLIPSolver(Solver):
                                 w_open = self.open_w[face]
                             if w_open > 0.0:
                                 if self.grid2mat[nb] >= 0:
-                                    acc -= self.p_d[nb] * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
+                                    acc -= self.p_d[nb] * w_open * 0.5 * (self.target_fraction[cell] + self.target_fraction[nb])
                 self.p_ap[cell] = self.p_diag[cell] * self.p_d[cell] + acc
 
     @qd.kernel
