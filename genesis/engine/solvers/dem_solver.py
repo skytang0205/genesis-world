@@ -226,11 +226,11 @@ class DEMSolver(Solver):
         half_extent : float
             Half side length of the square sieve in meters.
         bar_width : float
-            Bar width in meters.
+            Rod diameter in meters.
         bar_period : float
             Bar center-to-center period in meters (opening = period - bar_width).
         thickness : float
-            Bar thickness (z) in meters.
+            Unused for round rods (kept for API compatibility).
         pos : tuple, shape (3,)
             Center of the sieve plane in meters.
         vel : tuple, shape (3,), optional
@@ -443,8 +443,8 @@ class DEMSolver(Solver):
 
     @qd.func
     def _func_sieve_sdf(self, pos, i_b: qd.i32):
-        # signed distance to the sieve solid (negative inside a bar): union of two perpendicular
-        # families of bars, each a periodic box family clipped to the square extent
+        # signed distance to the sieve solid (negative inside a rod): union of two perpendicular
+        # families of horizontal cylinders (round rods, bw = rod diameter), clipped to the square extent
         rel = pos - self.sieve_pos[i_b]
         half = self.sieve_params[i_b][0]
         bw = self.sieve_params[i_b][1]
@@ -452,14 +452,12 @@ class DEMSolver(Solver):
         thick = self.sieve_params[i_b][3]
         sdf = gs.qd_float(1e30)
         for fam in qd.static(range(2)):
-            # distance to the nearest bar centerline along the family's cross direction
+            # distance to the nearest cylinder (rod along the family's axis, round cross-section)
             u = rel[fam]
             v = rel[1 - fam]
-            d_bar = abs(u - period * qd.floor(u / period + 0.5)) - 0.5 * bw
-            d_fam = qd.max(
-                qd.max(d_bar, abs(rel[2]) - 0.5 * thick),
-                qd.max(abs(u) - half, abs(v) - half),
-            )
+            d_center = abs(u - period * qd.floor(u / period + 0.5))
+            d_fam = qd.sqrt(d_center * d_center + rel[2] * rel[2]) - 0.5 * bw
+            d_fam = qd.max(d_fam, qd.max(abs(u) - half, abs(v) - half))
             sdf = qd.min(sdf, d_fam)
         return sdf
 
