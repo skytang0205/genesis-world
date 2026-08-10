@@ -244,6 +244,16 @@ class DEMSolver(Solver):
         self.sieve_enabled.from_numpy(np.ones((self._B,), dtype=gs.np_int))
         self.sieve_pos.from_numpy(np.tile(np.asarray(pos, dtype=gs.np_float), (self._B, 1)))
         self.sieve_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
+        self._kernel_init_delete_sieve()
+
+    @qd.kernel
+    def _kernel_init_delete_sieve(self):
+        # C++ Collider::InitDelete: grains initialized inside the sieve bars are removed
+        # (otherwise projecting them out at the first step creates deep overlaps and an explosion)
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                if self._func_sieve_sdf(self.particles[i_p, i_b].pos, i_b) < 0.0:
+                    self.particles[i_p, i_b].active = False
 
     @gs.assert_built
     def set_sieve_vel(self, vel):
