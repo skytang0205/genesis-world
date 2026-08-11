@@ -6,7 +6,7 @@ import quadrants as qd
 import genesis as gs
 from genesis.engine.boundaries import CubeBoundary
 from genesis.engine.entities import DEMEntity
-from genesis.utils.geom import SpatialHasher
+from genesis.utils.geom import SpatialHasher, qd_transform_by_quat_fast
 
 from .base_solver import Solver
 
@@ -31,9 +31,11 @@ class DEMSolver(Solver):
       trigger zone `phi < 0.5 * radius`; projection `x -= n * phi` and velocity reflection
       `v -= 1.5 * (v . n) * n` when `phi < 0`; wall friction `a += (a . n) * tan(friction_angle) * t_hat`
       on the acceleration when `a . n < 0`, where `t_hat` is the normalized tangential velocity.
-    - Moving box obstacle (optional): same enforcement as the domain collider, but with the particle
-      velocity replaced by the velocity relative to the obstacle (`delta_vel` in the C++ code), so a
-      moving obstacle drags/scoops grains via the restitution and friction terms.
+    - Moving obstacles (optional: axis-aligned box, sieve, tilted box): same enforcement as the domain
+      collider, but with the particle velocity replaced by the velocity relative to the obstacle
+      (`delta_vel` in the C++ code), so a moving obstacle drags/scoops grains via the restitution and
+      friction terms. The tilted box carries a fixed orientation quaternion; its SDF is evaluated by
+      inverse-rotating the query point into the box frame.
 
     The capillary (liquid-bridge) cohesion of the reference is identically zero for dry sand
     (its coefficient vanishes at zero saturation) and is therefore omitted until the wet-sand coupling phase.
@@ -153,6 +155,13 @@ class DEMSolver(Solver):
         self.sieve_params = qd.field(gs.qd_vec4, shape=(self._B,))  # half_extent, bar_width, bar_period, thickness
         self.sieve_enabled = qd.field(gs.qd_int, shape=(self._B,))
 
+        # optional moving tilted box obstacle (rotated thin box, e.g. a shovel); see set_tilt_box_obstacle
+        self.tilt_pos = qd.field(gs.qd_vec3, shape=(self._B,))
+        self.tilt_vel = qd.field(gs.qd_vec3, shape=(self._B,))
+        self.tilt_quat = qd.field(gs.qd_vec4, shape=(self._B,))  # (w, x, y, z), fixed after placement
+        self.tilt_half = qd.field(gs.qd_vec3, shape=(self._B,))
+        self.tilt_enabled = qd.field(gs.qd_int, shape=(self._B,))
+
     @property
     def is_active(self):
         return self.n_particles > 0
@@ -268,6 +277,58 @@ class DEMSolver(Solver):
         Current center position of the sieve (per env, shape (n_envs, 3)).
         """
         return self.sieve_pos.to_numpy()
+
+    @gs.assert_built
+    def set_tilt_box_obstacle(self, half_extents, pos, quat=(1.0, 0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0)):
+        """
+        Place (or replace) a rotated box obstacle (e.g. an inclined shovel blade) and enable it.
+
+        Same motion model as the box/sieve obstacles: the position is advanced internally by `vel * ddt` at
+        every DEM sub-substep; only the velocity setpoint is scripted (see set_box_obstacle). The orientation
+        is fixed after placement (translation only). Grains overlapping the box at placement are removed
+        (C++ Collider::InitDelete), so the box may be placed inside the sand bed.
+
+        Parameters
+        ----------
+        half_extents : tuple, shape (3,)
+            Half extents of the box in its local frame in meters.
+        pos : tuple, shape (3,)
+            Center of the box in meters.
+        quat : tuple, shape (4,), optional
+            Orientation of the box as a quaternion (w, x, y, z); normalized internally. Defaults to identity.
+        vel : tuple, shape (3,), optional
+            Velocity of the box in m/s. Defaults to zero.
+        """
+        quat_np = np.asarray(quat, dtype=gs.np_float)
+        quat_np = quat_np / np.linalg.norm(quat_np)
+        self.tilt_half.from_numpy(np.tile(np.asarray(half_extents, dtype=gs.np_float), (self._B, 1)))
+        self.tilt_quat.from_numpy(np.tile(quat_np, (self._B, 1)))
+        self.tilt_enabled.from_numpy(np.ones((self._B,), dtype=gs.np_int))
+        self.tilt_pos.from_numpy(np.tile(np.asarray(pos, dtype=gs.np_float), (self._B, 1)))
+        self.tilt_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
+        self._kernel_init_delete_tilt_box()
+
+    @qd.kernel
+    def _kernel_init_delete_tilt_box(self):
+        # C++ Collider::InitDelete, same as _kernel_init_delete_sieve
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles[i_p, i_b].active:
+                if self._func_tilt_box_sdf(self.particles[i_p, i_b].pos, i_b) < 0.0:
+                    self.particles[i_p, i_b].active = False
+
+    @gs.assert_built
+    def set_tilt_box_vel(self, vel):
+        """
+        Set the velocity of the tilted box obstacle. Its position is advanced internally every DEM sub-substep.
+        """
+        self.tilt_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
+
+    @gs.assert_built
+    def get_tilt_box_pos(self):
+        """
+        Current center position of the tilted box obstacle (per env, shape (n_envs, 3)).
+        """
+        return self.tilt_pos.to_numpy()
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------- kernels --------------------------------------
@@ -476,6 +537,36 @@ class DEMSolver(Solver):
             n = n / norm
         return n
 
+    @qd.func
+    def _func_tilt_box_sdf(self, pos, i_b: qd.i32):
+        # signed distance to the rotated box (negative inside): transform the query point into the box
+        # local frame with the conjugate quaternion, then evaluate the standard axis-aligned box SDF
+        rel = pos - self.tilt_pos[i_b]
+        q = self.tilt_quat[i_b]
+        q_conj = qd.Vector([q[0], -q[1], -q[2], -q[3]])
+        rel_local = qd_transform_by_quat_fast(rel, q_conj)
+        half = self.tilt_half[i_b]
+        qx = abs(rel_local[0]) - half[0]
+        qy = abs(rel_local[1]) - half[1]
+        qz = abs(rel_local[2]) - half[2]
+        q_pos = qd.Vector([max(qx, 0.0), max(qy, 0.0), max(qz, 0.0)])
+        return q_pos.norm() + min(max(qx, max(qy, qz)), 0.0)
+
+    @qd.func
+    def _func_tilt_box_normal(self, pos, i_b: qd.i32):
+        # inward normal of the tilted box SDF by central differences (box edges are non-smooth, as with
+        # the reference's level-set gradient normals)
+        eps = gs.qd_float(1e-5)
+        n = qd.Vector.zero(gs.qd_float, 3)
+        for a in qd.static(range(3)):
+            dp = qd.Vector.zero(gs.qd_float, 3)
+            dp[a] = eps
+            n[a] = self._func_tilt_box_sdf(pos + dp, i_b) - self._func_tilt_box_sdf(pos - dp, i_b)
+        norm = n.norm()
+        if norm > gs.EPS:
+            n = n / norm
+        return n
+
     @qd.kernel
     def _kernel_enforce_boundary(self, f: qd.i32, particle_radius: qd.f32, tan_fric: qd.f32):
         # C++ Collider::Enforce(DEMParticles, ddt, radius): domain box (static, phi positive inside) plus an
@@ -577,6 +668,24 @@ class DEMSolver(Solver):
                             if vt_norm > gs.EPS:
                                 acc = acc + acc_n * tan_fric * dv_tangential / vt_norm
 
+                # moving tilted box obstacle (same enforcement semantics)
+                if self.tilt_enabled[i_b] == 1:
+                    phi_t = self._func_tilt_box_sdf(pos, i_b)
+                    if phi_t < 0.5 * particle_radius:
+                        n_t = self._func_tilt_box_normal(pos, i_b)
+                        delta_vel = vel - self.tilt_vel[i_b]
+                        if phi_t < 0.0:
+                            pos = pos - n_t * phi_t
+                            dv_n = delta_vel.dot(n_t)
+                            if dv_n < 0.0:
+                                vel = vel - 1.5 * dv_n * n_t
+                        acc_n = acc.dot(n_t)
+                        if acc_n < 0.0:
+                            dv_tangential = delta_vel - delta_vel.dot(n_t) * n_t
+                            vt_norm = dv_tangential.norm()
+                            if vt_norm > gs.EPS:
+                                acc = acc + acc_n * tan_fric * dv_tangential / vt_norm
+
                 self.particles[i_p, i_b].pos = pos
                 self.particles[i_p, i_b].vel = vel
                 self.particles[i_p, i_b].acc = acc
@@ -589,6 +698,8 @@ class DEMSolver(Solver):
                 self.obstacle_pos[i_b] = self.obstacle_pos[i_b] + self.obstacle_vel[i_b] * ddt
             if self.sieve_enabled[i_b] == 1:
                 self.sieve_pos[i_b] = self.sieve_pos[i_b] + self.sieve_vel[i_b] * ddt
+            if self.tilt_enabled[i_b] == 1:
+                self.tilt_pos[i_b] = self.tilt_pos[i_b] + self.tilt_vel[i_b] * ddt
 
     @qd.kernel
     def _kernel_integrate(self, f: qd.i32, ddt: qd.f32):
