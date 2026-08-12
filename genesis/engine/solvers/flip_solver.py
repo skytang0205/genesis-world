@@ -110,7 +110,10 @@ class FLIPSolver(Solver):
         self._max_ratio = (
             float(self._sim.dem_solver._entities[0].material.max_ratio) if self._dem_coupling else 0.1
         )
-        self._fraction_floor = 1.0 - 0.74 * (1.0 + self._max_ratio)
+        # The C++ lower bound goes non-positive for max_ratio >~ 0.35, and the projection divides
+        # by the cell fraction (A = diag(1/f) * M), so a non-positive fraction blows up the solve;
+        # clamp to a small positive value to keep max_ratio up to 0.5 usable.
+        self._fraction_floor = max(1.0 - 0.74 * (1.0 + self._max_ratio), 1e-3)
 
         # FIXME: _gravity must be a raw qd.field() -- see comment in mpm_solver.py
         if self._gravity is not None:
