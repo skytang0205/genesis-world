@@ -34,8 +34,9 @@ class DEMSolver(Solver):
     - Moving obstacles (optional: axis-aligned box, sieve, tilted box): same enforcement as the domain
       collider, but with the particle velocity replaced by the velocity relative to the obstacle
       (`delta_vel` in the C++ code), so a moving obstacle drags/scoops grains via the restitution and
-      friction terms. The tilted box carries a fixed orientation quaternion; its SDF is evaluated by
-      inverse-rotating the query point into the box frame.
+      friction terms. The tilted box also carries an angular velocity about its center; its SDF is
+      evaluated by inverse-rotating the query point into the box frame, and the obstacle velocity at a
+      contact point is `v_center + omega x (pos - center)`.
 
     The capillary (liquid-bridge) cohesion of the reference is identically zero for dry sand
     (its coefficient vanishes at zero saturation) and is therefore omitted until the wet-sand coupling phase.
@@ -158,7 +159,8 @@ class DEMSolver(Solver):
         # optional moving tilted box obstacle (rotated thin box, e.g. a shovel); see set_tilt_box_obstacle
         self.tilt_pos = qd.field(gs.qd_vec3, shape=(self._B,))
         self.tilt_vel = qd.field(gs.qd_vec3, shape=(self._B,))
-        self.tilt_quat = qd.field(gs.qd_vec4, shape=(self._B,))  # (w, x, y, z), fixed after placement
+        self.tilt_omega = qd.field(gs.qd_vec3, shape=(self._B,))  # angular velocity about the box center
+        self.tilt_quat = qd.field(gs.qd_vec4, shape=(self._B,))  # (w, x, y, z)
         self.tilt_half = qd.field(gs.qd_vec3, shape=(self._B,))
         # optional handle attached at the box's local -x face: (length, half_thickness, angle), angle in the
         # local xz-plane measured from the box face (0 = straight back along -x); length 0 disables it
@@ -288,8 +290,8 @@ class DEMSolver(Solver):
 
         Same motion model as the box/sieve obstacles: the position is advanced internally by `vel * ddt` at
         every DEM sub-substep; only the velocity setpoint is scripted (see set_box_obstacle). The orientation
-        is fixed after placement (translation only). Grains overlapping the box at placement are removed
-        (C++ Collider::InitDelete), so the box may be placed inside the sand bed.
+        advances likewise from the angular velocity setpoint (see set_tilt_box_vel). Grains overlapping the
+        box at placement are removed (C++ Collider::InitDelete), so the box may be placed inside the sand bed.
 
         Parameters
         ----------
@@ -314,6 +316,7 @@ class DEMSolver(Solver):
         self.tilt_enabled.from_numpy(np.ones((self._B,), dtype=gs.np_int))
         self.tilt_pos.from_numpy(np.tile(np.asarray(pos, dtype=gs.np_float), (self._B, 1)))
         self.tilt_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
+        self.tilt_omega.from_numpy(np.zeros((self._B, 3), dtype=gs.np_float))
         self._kernel_init_delete_tilt_box()
 
     @qd.kernel
@@ -325,11 +328,20 @@ class DEMSolver(Solver):
                     self.particles[i_p, i_b].active = False
 
     @gs.assert_built
-    def set_tilt_box_vel(self, vel):
+    def set_tilt_box_vel(self, vel, omega=(0.0, 0.0, 0.0)):
         """
-        Set the velocity of the tilted box obstacle. Its position is advanced internally every DEM sub-substep.
+        Set the velocity of the tilted box obstacle. Its position and orientation are advanced internally
+        every DEM sub-substep.
+
+        Parameters
+        ----------
+        vel : tuple, shape (3,)
+            Velocity of the box center in m/s.
+        omega : tuple, shape (3,), optional
+            Angular velocity in rad/s (world frame); the box rotates about its own center. Defaults to zero.
         """
         self.tilt_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
+        self.tilt_omega.from_numpy(np.tile(np.asarray(omega, dtype=gs.np_float), (self._B, 1)))
 
     @gs.assert_built
     def get_tilt_box_pos(self):
@@ -337,6 +349,13 @@ class DEMSolver(Solver):
         Current center position of the tilted box obstacle (per env, shape (n_envs, 3)).
         """
         return self.tilt_pos.to_numpy()
+
+    @gs.assert_built
+    def get_tilt_box_quat(self):
+        """
+        Current orientation of the tilted box obstacle as a quaternion (w, x, y, z) (per env, shape (n_envs, 4)).
+        """
+        return self.tilt_quat.to_numpy()
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------- kernels --------------------------------------
@@ -691,12 +710,14 @@ class DEMSolver(Solver):
                             if vt_norm > gs.EPS:
                                 acc = acc + acc_n * tan_fric * dv_tangential / vt_norm
 
-                # moving tilted box obstacle (same enforcement semantics)
+                # moving tilted box obstacle (same enforcement semantics; the obstacle velocity is evaluated
+                # at the contact point: v_col = v_center + omega x (pos - center))
                 if self.tilt_enabled[i_b] == 1:
                     phi_t = self._func_tilt_box_sdf(pos, i_b)
                     if phi_t < 0.5 * particle_radius:
                         n_t = self._func_tilt_box_normal(pos, i_b)
-                        delta_vel = vel - self.tilt_vel[i_b]
+                        v_col = self.tilt_vel[i_b] + self.tilt_omega[i_b].cross(pos - self.tilt_pos[i_b])
+                        delta_vel = vel - v_col
                         if phi_t < 0.0:
                             pos = pos - n_t * phi_t
                             dv_n = delta_vel.dot(n_t)
@@ -723,6 +744,20 @@ class DEMSolver(Solver):
                 self.sieve_pos[i_b] = self.sieve_pos[i_b] + self.sieve_vel[i_b] * ddt
             if self.tilt_enabled[i_b] == 1:
                 self.tilt_pos[i_b] = self.tilt_pos[i_b] + self.tilt_vel[i_b] * ddt
+                om = self.tilt_omega[i_b]
+                if om.norm_sqr() > 0.0:
+                    # q_dot = 0.5 * (0, omega) x q (quaternion product)
+                    q = self.tilt_quat[i_b]
+                    dq = qd.Vector(
+                        [
+                            -om[0] * q[1] - om[1] * q[2] - om[2] * q[3],
+                            om[0] * q[0] + om[1] * q[3] - om[2] * q[2],
+                            -om[0] * q[3] + om[1] * q[0] + om[2] * q[1],
+                            om[0] * q[2] - om[1] * q[1] + om[2] * q[0],
+                        ]
+                    )
+                    q_new = q + 0.5 * dq * ddt
+                    self.tilt_quat[i_b] = q_new / q_new.norm()
 
     @qd.kernel
     def _kernel_integrate(self, f: qd.i32, ddt: qd.f32):
