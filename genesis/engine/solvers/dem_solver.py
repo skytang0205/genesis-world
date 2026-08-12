@@ -160,6 +160,9 @@ class DEMSolver(Solver):
         self.tilt_vel = qd.field(gs.qd_vec3, shape=(self._B,))
         self.tilt_quat = qd.field(gs.qd_vec4, shape=(self._B,))  # (w, x, y, z), fixed after placement
         self.tilt_half = qd.field(gs.qd_vec3, shape=(self._B,))
+        # optional handle attached at the box's local -x face: (length, half_thickness, angle), angle in the
+        # local xz-plane measured from the box face (0 = straight back along -x); length 0 disables it
+        self.tilt_handle = qd.field(gs.qd_vec3, shape=(self._B,))
         self.tilt_enabled = qd.field(gs.qd_int, shape=(self._B,))
 
     @property
@@ -279,7 +282,7 @@ class DEMSolver(Solver):
         return self.sieve_pos.to_numpy()
 
     @gs.assert_built
-    def set_tilt_box_obstacle(self, half_extents, pos, quat=(1.0, 0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0)):
+    def set_tilt_box_obstacle(self, half_extents, pos, quat=(1.0, 0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), handle=(0.0, 0.0, 0.0)):
         """
         Place (or replace) a rotated box obstacle (e.g. an inclined shovel blade) and enable it.
 
@@ -298,11 +301,16 @@ class DEMSolver(Solver):
             Orientation of the box as a quaternion (w, x, y, z); normalized internally. Defaults to identity.
         vel : tuple, shape (3,), optional
             Velocity of the box in m/s. Defaults to zero.
+        handle : tuple, shape (3,), optional
+            Optional handle bar (a shovel grip): (length, half_thickness, angle) in meters / radians. The bar
+            is attached at the box's local -x face and points up-back in the local xz-plane; angle is measured
+            from the box face (0 = straight back along -x). The default zero length disables the handle.
         """
         quat_np = np.asarray(quat, dtype=gs.np_float)
         quat_np = quat_np / np.linalg.norm(quat_np)
         self.tilt_half.from_numpy(np.tile(np.asarray(half_extents, dtype=gs.np_float), (self._B, 1)))
         self.tilt_quat.from_numpy(np.tile(quat_np, (self._B, 1)))
+        self.tilt_handle.from_numpy(np.tile(np.asarray(handle, dtype=gs.np_float), (self._B, 1)))
         self.tilt_enabled.from_numpy(np.ones((self._B,), dtype=gs.np_int))
         self.tilt_pos.from_numpy(np.tile(np.asarray(pos, dtype=gs.np_float), (self._B, 1)))
         self.tilt_vel.from_numpy(np.tile(np.asarray(vel, dtype=gs.np_float), (self._B, 1)))
@@ -550,7 +558,22 @@ class DEMSolver(Solver):
         qy = abs(rel_local[1]) - half[1]
         qz = abs(rel_local[2]) - half[2]
         q_pos = qd.Vector([max(qx, 0.0), max(qy, 0.0), max(qz, 0.0)])
-        return q_pos.norm() + min(max(qx, max(qy, qz)), 0.0)
+        phi = q_pos.norm() + min(max(qx, max(qy, qz)), 0.0)
+        # optional handle: bar attached at the local -x face, pointing up-back in the local xz-plane
+        # (d = bar axis, e2 = in-plane normal); unioned with the blade SDF
+        hlen = self.tilt_handle[i_b][0]
+        if hlen > 0.0:
+            hrad = self.tilt_handle[i_b][1]
+            hang = self.tilt_handle[i_b][2]
+            d = qd.Vector([-qd.cos(hang), 0.0, qd.sin(hang)])
+            e2 = qd.Vector([qd.sin(hang), 0.0, qd.cos(hang)])
+            p = rel_local - qd.Vector([-half[0], 0.0, 0.0])
+            hx = abs(p.dot(d) - 0.5 * hlen) - 0.5 * hlen
+            hy = abs(p[1]) - hrad
+            hz = abs(p.dot(e2)) - hrad
+            h_pos = qd.Vector([max(hx, 0.0), max(hy, 0.0), max(hz, 0.0)])
+            phi = min(phi, h_pos.norm() + min(max(hx, max(hy, hz)), 0.0))
+        return phi
 
     @qd.func
     def _func_tilt_box_normal(self, pos, i_b: qd.i32):
