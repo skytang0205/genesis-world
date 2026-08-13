@@ -61,7 +61,7 @@ class FLIPSolver(Solver):
         # reference: m_ParticleRadFactor = 1.01 * sqrt(3) / 2
         self._particle_rad = 1.01 * math.sqrt(3.0) / 2.0 * self._dx
         # C++ m_ViscosityCoeff = 1 (quadratic drag on sand grains)
-        self._viscosity_coeff = 1.0
+        self._viscosity_coeff = options.viscosity_coeff
 
         self._cylinder_radius = options.cylinder_radius
         self._has_cylinder = options.cylinder_radius is not None

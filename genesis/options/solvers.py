@@ -963,6 +963,11 @@ class FLIPOptions(Options):
         Whether to two-way couple with the DEM solver (sand) when one is active: sand grains feel pressure
         gradient / added-mass / drag forces and absorb water; the fluid sees the grains' displaced volume and
         the coupling reaction force. Disable for a pure-water scene to skip all coupling work. Defaults to True.
+    viscosity_coeff : float, optional
+        Coefficient of the quadratic drag exchanged between sand grains and the surrounding fluid.
+        Lower values let water infiltrate deeper into the sand bed instead of spreading on the surface,
+        at the cost of weaker two-way coupling (grains are also dragged less by the flow). Defaults to 1.0,
+        matching the reference implementation.
     cylinder_radius : float, optional
         If set, an additional static hollow-cylinder collider (axis along z through the domain center) confines
         the fluid and grains, following the reference's rotate-scene boundary. Defaults to None (box domain only).
@@ -988,6 +993,7 @@ class FLIPOptions(Options):
     pcg_max_iter: PositiveInt = 200
     pcg_tol: PositiveFloat = 1e-4
     dem_coupling: StrictBool = True
+    viscosity_coeff: NonNegativeFloat = 1.0
 
     cylinder_radius: PositiveFloat | None = None
     rotate_omega: float = 0.0
