@@ -224,15 +224,11 @@ def main():
             surface=wall_surface,
         )
 
-    blade = scene.add_entity(
-        morph=gs.morphs.Box(size=tuple(2.0 * np.array(BLADE_HALF))),
+    # real shovel asset (objaverse 'Shovel vintage', aligned to the tilt-box frame by
+    # phase8_shovel_align.py); its frame origin coincides with the physical blade box
+    shovel = scene.add_entity(
+        morph=gs.morphs.Mesh(file=os.path.join(EXPERIMENTS_DIR, "assets", "shovel_vintage_aligned.glb")),
         material=gs.materials.Kinematic(),
-        surface=gs.surfaces.Default(color=(0.4, 0.7, 1.0)),
-    )
-    handle = scene.add_entity(
-        morph=gs.morphs.Box(size=(HANDLE_LEN, 2.0 * HANDLE_HALF_THICK, 2.0 * HANDLE_HALF_THICK)),
-        material=gs.materials.Kinematic(),
-        surface=gs.surfaces.Default(color=(0.6, 0.4, 0.2)),
     )
     franka = scene.add_entity(
         gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml", pos=FRANKA_BASE_POS),
@@ -302,11 +298,9 @@ def main():
         buf[: len(water_pos)] = water_pos
         water.set_particles_pos(buf[None])
 
-        blade.set_pos(blade_pos)
-        blade.set_quat(blade_quat)
+        shovel.set_pos(blade_pos)
+        shovel.set_quat(blade_quat)
         handle_pos, handle_quat = blade_to_handle(blade_pos, blade_quat)
-        handle.set_pos(handle_pos)
-        handle.set_quat(handle_quat)
 
         # continuous arm tracking
         target_pos, target_quat = hand_target_from_handle(handle_pos, handle_quat)

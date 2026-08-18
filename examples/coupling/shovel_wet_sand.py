@@ -195,34 +195,15 @@ def main():
     blade_quat0 = np.array(
         [math.cos(BLADE_ANGLE / 2.0), 0.0, math.sin(BLADE_ANGLE / 2.0), 0.0]
     )
-    blade = scene.add_entity(
-        morph=gs.morphs.Box(
+    # real shovel asset (objaverse 'Shovel vintage', aligned to the tilt-box frame by
+    # phase8_shovel_align.py): pure visualization; physics stays with the DEM tilt-box obstacle
+    shovel = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file=os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "shovel_vintage_aligned.glb"),
             pos=BLADE_POS0,
             quat=tuple(blade_quat0),
-            size=tuple(2.0 * np.array(BLADE_HALF)),
         ),
         material=gs.materials.Kinematic(),
-        surface=gs.surfaces.Default(color=(0.4, 0.7, 1.0)),
-    )
-    # visualization-only handle; fixed in the blade frame, so its world pose follows the blade quat
-    handle_quat_rel = np.array(
-        [
-            math.cos((math.pi + HANDLE_ANGLE) / 2.0),
-            0.0,
-            math.sin((math.pi + HANDLE_ANGLE) / 2.0),
-            0.0,
-        ]
-    )
-    handle_dir_local = np.array([-math.cos(HANDLE_ANGLE), 0.0, math.sin(HANDLE_ANGLE)])
-    handle_offset_local = np.array([-BLADE_HALF[0], 0.0, 0.0]) + handle_dir_local * (HANDLE_LEN / 2.0)
-    handle = scene.add_entity(
-        morph=gs.morphs.Box(
-            pos=tuple(np.array(BLADE_POS0) + quat_to_R(blade_quat0) @ handle_offset_local),
-            quat=tuple(quat_mul(blade_quat0, handle_quat_rel)),
-            size=(HANDLE_LEN, 2.0 * HANDLE_HALF_THICK, 2.0 * HANDLE_HALF_THICK),
-        ),
-        material=gs.materials.Kinematic(),
-        surface=gs.surfaces.Default(color=(0.6, 0.4, 0.2)),
     )
     sand = scene.add_entity(
         morph=gs.morphs.Box(
@@ -327,10 +308,8 @@ def main():
         # sync the visualization-only kinematic shovel with the solver's obstacle
         blade_pos = dem.get_tilt_box_pos()[0]
         blade_quat = dem.get_tilt_box_quat()[0]
-        blade.set_pos(blade_pos)
-        blade.set_quat(blade_quat)
-        handle.set_pos(blade_pos + quat_to_R(blade_quat) @ handle_offset_local)
-        handle.set_quat(quat_mul(blade_quat, handle_quat_rel))
+        shovel.set_pos(blade_pos)
+        shovel.set_quat(blade_quat)
 
         scene.step()
 
